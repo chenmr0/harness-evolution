@@ -15,6 +15,7 @@ from app.db.models.evolution import EvolutionRoundRecord, EvolutionRunRecord
 from app.errors import AppError, ErrorCode
 from app.service.evolution.engine.contracts import EvalGateway, EvalRequest, RunBlocked
 from app.service.evolution.events import EvolutionRunEventService
+from app.third_party_api.evaluation.models import AmbiguousEvaluationSubmission
 from app.utils.redaction import sanitize_message, sanitize_value
 from app.utils.time import now_shanghai
 
@@ -91,7 +92,11 @@ class EvolutionEvalSubmitter:
                     target_name=run.target_name,
                     target_version=run.target_version,
                     cluster_id=round_.probe_cluster_id,
-                    idempotency_key=(f"{run.id}:{round_.seq}:{round_.candidate_commit}"),
+                    idempotency_key=(
+                        f"{run.id}:{round_.seq}:{round_.candidate_commit}:{round_.eval_attempts}"
+                    ),
+                    baseline_ref=(round_.patch or {}).get("baseline_ref"),
+                    baseline_commit=(round_.patch or {}).get("baseline_commit"),
                 ),
             )
             if not submission.eval_id.strip():
@@ -117,7 +122,22 @@ class EvolutionEvalSubmitter:
                 payload={"ref": round_.candidate_ref, "commit": round_.candidate_commit},
                 error=exc,
             )
-            raise RunBlocked(safe, stage="eval") from None
+            ambiguous = isinstance(exc, AmbiguousEvaluationSubmission)
+            if ambiguous:
+                await self._runs.mark_blocked(
+                    run.id,
+                    stage="eval",
+                    message=safe,
+                    error_stage="eval_submission_ambiguous",
+                    next_retry_at=None,
+                    retry_attempts=0,
+                )
+            raise RunBlocked(
+                safe,
+                stage="eval",
+                error_stage="eval_submission_ambiguous" if ambiguous else "eval",
+                retryable=not ambiguous,
+            ) from None
         current = self._now()
         submitted = await self._runs.mark_eval_submitted(
             run.id,
@@ -286,8 +306,6 @@ class EvolutionEvalPoller:
 
         for run in await self._runs.list_running_full_runs(limit=self._batch_size):
             rounds = await self._runs.list_rounds(run.id)
-            if not rounds:
-                continue
             active = {
                 "patching",
                 "pushing",

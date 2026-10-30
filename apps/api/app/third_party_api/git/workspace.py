@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -73,11 +74,14 @@ class Patch:
     """One deterministic patch applied inside an isolated workspace."""
 
     file: str
-    lines: tuple[str, ...]
+    lines: tuple[str, ...] = ()
+    changes: dict[str, str | None] | None = None
 
     @property
     def sha256(self) -> str:
         """Return the stable digest recorded in candidate trailers."""
+        if self.changes is not None:
+            return hashlib.sha256(json.dumps(self.changes, sort_keys=True).encode()).hexdigest()
         body = "\n".join(self.lines)
         return hashlib.sha256(
             f"{self.file}\0{body}".encode(),
@@ -254,6 +258,40 @@ class GitWorkspaceManager:
             branch=branch,
         )
 
+    async def publish_skill_snapshot(
+        self,
+        workspace_path: Path,
+        *,
+        branch: str,
+        commit: str,
+    ) -> str:
+        """Publish a stable evaluation branch without rewriting an existing snapshot."""
+        if not re.fullmatch(r"evo-snapshot/[A-Za-z0-9._/-]+", branch):
+            raise GitOperationError("invalid snapshot branch", stage="push")
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise GitOperationError("invalid snapshot commit", stage="push")
+        if not self._push_enabled:
+            raise GitOperationError("Skill evaluation requires branch publication", stage="push")
+        remote = await self.remote_ref_commit(workspace_path, "origin", branch)
+        if remote is not None and remote != commit:
+            raise GitOperationError("immutable snapshot branch conflict", stage="push")
+        if remote is None:
+            await self._push_checked(
+                workspace_path,
+                (
+                    "git",
+                    "push",
+                    f"--force-with-lease=refs/heads/{branch}:",
+                    "origin",
+                    f"{commit}:refs/heads/{branch}",
+                ),
+            )
+            if await self.remote_ref_commit(workspace_path, "origin", branch) != commit:
+                raise GitOperationError(
+                    "snapshot branch publication was not verified", stage="push"
+                )
+        return branch
+
     async def create_candidate(
         self,
         prepared: PreparedWorkspace,
@@ -272,7 +310,13 @@ class GitWorkspaceManager:
             stage="workspace",
             failure="run branch could not be selected",
         )
-        if not re.fullmatch(rf"{re.escape(run_branch)}/candidate/r[1-9]\d*", candidate_ref):
+        if not (
+            re.fullmatch(rf"{re.escape(run_branch)}/candidate/r[1-9]\d*", candidate_ref)
+            or re.fullmatch(
+                rf"evo-candidate/{re.escape(run_branch.removeprefix('evo/'))}/r[1-9]\d*",
+                candidate_ref,
+            )
+        ):
             raise GitOperationError("candidate ref does not match the run", stage="workspace")
         run_id = expected_run_id or _required_trailer(message, "Harness-Run-Id")
         if not _has_trailer(message, "Harness-Run-Id", run_id):
@@ -302,7 +346,7 @@ class GitWorkspaceManager:
         self._write_patch(prepared.path, patch)
         await self._git_checked(
             prepared.path,
-            ("git", "add", "--", patch.file),
+            ("git", "add", "--", *(patch.changes or {patch.file: None})),
             stage="patch",
             failure="candidate patch could not be staged",
         )
@@ -367,7 +411,7 @@ class GitWorkspaceManager:
                 "git",
                 "push",
                 "origin",
-                f"{candidate.commit}:refs/tags/{candidate.ref}",
+                f"{candidate.commit}:{_candidate_git_ref(candidate.ref)}",
             )
         else:
             if remote != expected_remote_commit:
@@ -378,9 +422,9 @@ class GitWorkspaceManager:
             args = (
                 "git",
                 "push",
-                f"--force-with-lease=refs/tags/{candidate.ref}:{expected_remote_commit}",
+                f"--force-with-lease={_candidate_git_ref(candidate.ref)}:{expected_remote_commit}",
                 "origin",
-                f"{candidate.commit}:refs/tags/{candidate.ref}",
+                f"{candidate.commit}:{_candidate_git_ref(candidate.ref)}",
             )
         await self._push_checked(candidate.workspace_path, args)
 
@@ -608,6 +652,8 @@ class GitWorkspaceManager:
         ref: str,
     ) -> str | None:
         """Resolve one candidate tag without treating it as a branch."""
+        if ref.startswith("evo-candidate/"):
+            return await self.remote_ref_commit(workspace_path, remote, ref)
         result = await self._git(
             workspace_path,
             ("git", "ls-remote", "--tags", remote, f"refs/tags/{ref}"),
@@ -749,7 +795,7 @@ class GitWorkspaceManager:
             return
         await self._push_checked(
             workspace_path,
-            ("git", "push", "origin", f":refs/tags/{ref}"),
+            ("git", "push", "origin", f":{_candidate_git_ref(ref)}"),
         )
 
     async def _reuse_or_reject(
@@ -1080,6 +1126,31 @@ class GitWorkspaceManager:
     @staticmethod
     def _write_patch(workspace_path: Path, patch: Patch) -> None:
         """Write a bounded repository-relative patch without path traversal."""
+        if patch.changes is not None:
+            destinations = []
+            for name, content in patch.changes.items():
+                from app.service.evolution.skill_safety import validate_path
+
+                validate_path(name)
+                destination = workspace_path / name
+                if any(
+                    parent.is_symlink()
+                    for parent in (destination, *destination.parents)
+                    if parent != workspace_path.parent
+                ):
+                    raise GitOperationError("symlink in patch path", stage="patch")
+                try:
+                    destination.resolve().relative_to(workspace_path.resolve())
+                except ValueError:
+                    raise GitOperationError("patch escapes workspace", stage="patch") from None
+                destinations.append((destination, content))
+            for destination, content in destinations:
+                if content is None:
+                    destination.unlink(missing_ok=True)
+                else:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_text(content, encoding="utf-8")
+            return
         relative = PurePosixPath(patch.file)
         if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
             raise GitOperationError("patch path is unsafe", stage="patch")
@@ -1227,3 +1298,9 @@ def candidate_local_branch(candidate_ref: str) -> str:
     """Map a remote candidate tag to a legal, non-conflicting local work branch."""
     digest = hashlib.sha256(candidate_ref.encode()).hexdigest()[:16]
     return f"harness-candidate/{digest}"
+
+
+def _candidate_git_ref(ref: str) -> str:
+    """Skill candidates are branches; legacy engines retain their tag protocol."""
+    namespace = "heads" if ref.startswith("evo-candidate/") else "tags"
+    return f"refs/{namespace}/{ref}"

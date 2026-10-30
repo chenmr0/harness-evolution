@@ -410,6 +410,19 @@ describe("run detail conformance", () => {
     expect(timeout.text()).toContain("评测超时");
   });
 
+  it("shows skipped evaluation as not run rather than pending", () => {
+    const skipped = mount(EvalCompare, {
+      props: {
+        evaluation: { status: "skipped", current: null, candidate: null, nextPollAt: null },
+        accepted: false,
+        roundStatus: "rejected",
+      },
+    });
+    expect(skipped.text()).toContain("未执行评测");
+    expect(skipped.text()).not.toContain("等待评测启动");
+    expect(skipped.text()).not.toContain("评测完成");
+  });
+
   it("labels the evaluated candidate commit on an accepted round", () => {
     const evaluatedCommit = "abcdef1234567890";
     const finalCommit = "fedcba0987654321";

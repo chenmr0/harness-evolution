@@ -164,6 +164,8 @@ class EvalRequest:
     target_version: str
     cluster_id: str
     idempotency_key: str
+    baseline_ref: str | None = None
+    baseline_commit: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -300,6 +302,8 @@ type ClusterPrepare = Callable[
 
 def default_gateway_factory(config: EvalGatewayConfig) -> EvalGateway:
     """Build the deterministic gateway used by the V1 evolution loop."""
+    if config.get("mode", "fake") != "fake":
+        raise ConfigError("Real evaluation requires a configured durable gateway factory")
     return FakeEvalGateway(config=config)
 
 

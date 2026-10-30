@@ -9,10 +9,11 @@ from typing import Any, Protocol, TypeVar, cast
 
 from app.db.crud.evolution import EvolutionRepository
 from app.db.crud.probe_query import ProbeHitRow
+from app.db.crud.skill_evolution import SkillEvolutionRepository
 from app.db.models.evolution import EvolutionRoundRecord, EvolutionRunRecord
 from app.db.models.jobs import JobRunRecord
 from app.errors import AppError, ErrorCode
-from app.service.evolution.advance import build_candidate_trace
+from app.service.evolution.advance import build_candidate_trace, build_frozen_candidate_trace
 from app.service.evolution.backoff import next_retry_delay
 from app.service.evolution.engine.contracts import EvolutionBlockedStage, RunBlocked
 from app.service.evolution.events import (
@@ -113,6 +114,7 @@ class EvolutionRetryService:
         eval_submitter: EvalResubmitter | None = None,
         probes: ProbeSourceReader | None = None,
         events: EvolutionRunEventService | None = None,
+        skill_states: SkillEvolutionRepository | None = None,
         now: Any = now_shanghai,
     ) -> None:
         """Bind durable state, stage services, queueing, and trace evidence."""
@@ -125,6 +127,7 @@ class EvolutionRetryService:
         self._eval_submitter = eval_submitter
         self._probes = probes
         self._events = events
+        self._skill_states = skill_states
         self._now = now
 
     async def request_retry(
@@ -146,6 +149,12 @@ class EvolutionRetryService:
                 code=ErrorCode.RUN_NOT_RETRYABLE,
                 message="run is not blocked, so it cannot be retried",
                 details={"status": run.status},
+            )
+        if (run.error_stage or "").endswith("_submission_ambiguous"):
+            raise AppError(
+                status_code=409,
+                code=ErrorCode.RUN_NOT_RETRYABLE,
+                message="evaluation submission requires provider reconciliation before retry",
             )
         await self._runs.reset_manual_retry(run.id)
         submission = await self._jobs.submit(
@@ -173,6 +182,13 @@ class EvolutionRetryService:
                 "status": run.status,
                 "reason": "run is not blocked",
             }
+        if (run.error_stage or "").endswith("_submission_ambiguous"):
+            raise RunBlocked(
+                "evaluation submission requires provider reconciliation before retry",
+                stage="eval",
+                error_stage=run.error_stage,
+                retryable=False,
+            )
         blocked_stage = cast(EvolutionBlockedStage, run.blocked_stage)
         if automatic and blocked_stage != "push":
             return {
@@ -189,7 +205,8 @@ class EvolutionRetryService:
         event_stage = _BLOCKED_STAGE_TO_EVENT_STAGE[blocked_stage]
         cleared_round: EvolutionRoundRecord | None = None
         previous_eval_id: str | None = None
-        if blocked_stage == "eval":
+        final_eval = blocked_stage == "eval" and run.error_stage == "final_eval"
+        if blocked_stage == "eval" and not final_eval:
             failed = await self._failed_eval_round(run.id)
             if failed is None:
                 raise RuntimeError("blocked evaluation round not found")
@@ -203,7 +220,9 @@ class EvolutionRetryService:
         if refreshed is not None:
             run = refreshed
         try:
-            if blocked_stage == "eval":
+            if final_eval:
+                dispatched = await self._finalize(run, job)
+            elif blocked_stage == "eval":
                 if cleared_round is None:
                     raise RuntimeError("evaluation retry round was not prepared")
                 dispatched = await self._resubmit_eval(
@@ -431,8 +450,6 @@ class EvolutionRetryService:
         round_: EvolutionRoundRecord,
     ) -> CandidateTrace:
         """Rebuild immutable candidate evidence for a regenerated patch."""
-        if self._probes is None:
-            raise RuntimeError("retry has no probe evidence reader")
         cluster = next(
             (
                 item
@@ -448,6 +465,16 @@ class EvolutionRetryService:
             for link in await self._runs.list_cluster_probes(run.id)
             if link.probe_cluster_id == cluster.probe_cluster_id
         )
+        state = await self._skill_states.get(run.id) if self._skill_states is not None else None
+        if state is not None:
+            return build_frozen_candidate_trace(
+                state,
+                cluster.probe_cluster_id,
+                cluster.probe_cluster_description,
+                links,
+            )
+        if self._probes is None:
+            raise RuntimeError("retry has no probe evidence reader")
         rows = await self._probes.list_rows_by_ids(links)
         return build_candidate_trace(
             cluster.probe_cluster_id,

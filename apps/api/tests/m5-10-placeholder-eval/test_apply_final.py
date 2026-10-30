@@ -17,6 +17,7 @@ from sqlalchemy import insert, update
 from app.config import DatabaseDialect, Settings
 from app.db.base import Database
 from app.db.crud.evolution import EvolutionRepository
+from app.db.crud.probe_query import ProbeHitRow
 from app.db.factory import create_database
 from app.db.migrate import upgrade_database
 from app.db.models.evolution import (
@@ -758,3 +759,376 @@ async def test_finalize_write_failure_is_recoverable(
     assert completed is not None
     assert completed.status == "completed"
     assert await repository.get_final("run-apply") is not None
+
+
+@pytest.mark.parametrize(
+    "current,candidate,external,accepted",
+    [
+        (80.0, 90.0, "reject", True),
+        (90.0, 80.0, "accept", False),
+        (80.0, 80.0, "accept", False),
+    ],
+)
+async def test_apply_uses_strict_score_not_external_verdict(
+    state: tuple[Database, EvolutionRepository],
+    current: float,
+    candidate: float,
+    external: str,
+    accepted: bool,
+) -> None:
+    database, repository = state
+    async with database.transaction() as session:
+        await session.execute(
+            update(evolution_rounds)
+            .where(
+                evolution_rounds.c.id == "round-apply",
+            )
+            .values(
+                eval_result={
+                    "currentScore": current,
+                    "candidateScore": candidate,
+                    "externalVerdict": external,
+                    "metrics": [],
+                }
+            )
+        )
+    service = EvolutionApplyService(repository, CandidateDouble(repository), EmptyProbeReader())  # type: ignore[arg-type]
+    result = await service.handle(_job("evolution_apply"))
+    assert result["accepted"] is accepted
+
+
+@pytest.mark.parametrize("accepted", [True, False])
+@pytest.mark.parametrize("fail_first", [True, False])
+@pytest.mark.parametrize("bad_evidence", [True, False])
+async def test_independent_final_is_durable_and_requires_an_accepted_change(
+    state: tuple[Database, EvolutionRepository],
+    accepted: bool,
+    fail_first: bool,
+    bad_evidence: bool,
+) -> None:
+    from app.db.crud.skill_evolution import SkillEvolutionRepository
+    from app.service.evolution.engine.contracts import EvalStatus, EvalSubmission
+
+    database, repository = state
+    async with database.transaction() as session:
+        await session.execute(
+            update(evolution_rounds)
+            .where(
+                evolution_rounds.c.id == "round-apply",
+            )
+            .values(
+                status="accepted" if accepted else "rejected",
+                accepted=accepted,
+                commit_hash="c" * 40 if accepted else None,
+            )
+        )
+        await session.execute(
+            update(evolution_runs)
+            .where(
+                evolution_runs.c.id == "run-apply",
+            )
+            .values(progress_unit=5, eval_config={"skillEvolution": "real"})
+        )
+    states = SkillEvolutionRepository(database)
+    await states.initialize("run-apply", {"files": {"SKILL.md": "base"}})
+    now = [NOW]
+    requests = []
+
+    class Gateway:
+        async def submit(self, request: Any) -> EvalSubmission:
+            requests.append(request)
+            return EvalSubmission(f"final-pair-{len(requests)}")
+
+        async def get_status(self, eval_id: str) -> EvalStatus:
+            if fail_first and not bad_evidence and eval_id == "final-pair-1":
+                return EvalStatus("failed")
+            return EvalStatus("completed")
+
+        async def get_result(self, eval_id: str) -> EvalResult:
+            if fail_first and bad_evidence and eval_id == "final-pair-1":
+                from app.third_party_api.evaluation.models import InvalidEvaluationEvidence
+
+                raise InvalidEvaluationEvidence("Evaluation case sets are not comparable")
+            return EvalResult(40.0, 55.0, "accept")
+
+    class Workspaces(WorkspaceDouble):
+        async def publish_skill_snapshot(self, path: Path, *, branch: str, commit: str) -> str:
+            assert commit == ("c" * 40 if accepted else "a" * 40)
+            return branch
+
+    workspaces = Workspaces()
+
+    def service() -> EvolutionFinalizeService:
+        return EvolutionFinalizeService(
+            repository,
+            workspaces,  # type: ignore[arg-type]
+            gateway_for_run=lambda run: Gateway(),  # type: ignore[arg-type,return-value]
+            skill_states=states,
+            now=lambda: now[0],
+        )
+
+    first = await service().handle(_job("evolution_finalize"))
+    assert first["finalized"] is False
+    assert await repository.get_final("run-apply") is None
+    # Reconstructing the service simulates restart: no second external submission.
+    await service().handle(_job("evolution_finalize"))
+    assert len(requests) == 1
+    now[0] += timedelta(minutes=5)
+    if fail_first:
+        with pytest.raises(RunBlocked) as error:
+            await service().handle(_job("evolution_finalize"))
+        assert error.value.error_stage == "final_eval"
+        blocked = await repository.get_run("run-apply")
+        assert blocked is not None and blocked.blocked_stage == "eval"
+        await repository.mark_resumed("run-apply")
+        await service().handle(_job("evolution_finalize"))
+        assert len(requests) == 2
+        assert requests[0].idempotency_key != requests[1].idempotency_key
+        now[0] += timedelta(minutes=5)
+    result = await service().handle(_job("evolution_finalize"))
+    assert result["finalized"] is True
+    final = await repository.get_final("run-apply")
+    assert final is not None
+    assert (final.init_score, final.best_score) == (40.0, 55.0)
+    assert final.verdict is accepted
+    assert requests[0].baseline_ref == "evo-snapshot/run-apply/baseline"
+    assert requests[0].ref == "evo-snapshot/run-apply/final-best"
+
+
+async def test_feedback_precedes_independent_final_evaluation(
+    state: tuple[Database, EvolutionRepository],
+) -> None:
+    database, repository = state
+    async with database.transaction() as session:
+        await session.execute(
+            update(evolution_rounds)
+            .where(
+                evolution_rounds.c.id == "round-apply",
+            )
+            .values(status="rejected")
+        )
+    async with database.transaction() as session:
+        await session.execute(
+            update(evolution_runs)
+            .where(
+                evolution_runs.c.id == "run-apply",
+            )
+            .values(eval_config={"skillEvolution": "real"})
+        )
+    calls = []
+
+    class Feedback:
+        async def advance_if_needed(self, run: Any, rounds: Any) -> bool:
+            calls.append((run.id, len(rounds)))
+            return True
+
+    def gateway(run: Any) -> Any:
+        raise AssertionError("final test must not run before validation feedback finishes")
+
+    service = EvolutionFinalizeService(
+        repository,
+        WorkspaceDouble(),  # type: ignore[arg-type]
+        feedback=Feedback(),
+        gateway_for_run=gateway,
+        skill_states=object(),  # type: ignore[arg-type]
+    )
+    result = await service.handle(_job("evolution_finalize"))
+    assert result["finalized"] is False
+    assert calls == [("run-apply", 1)]
+    assert await repository.get_final("run-apply") is None
+
+
+async def test_apply_and_retry_preserve_frozen_feedback_provenance(
+    state: tuple[Database, EvolutionRepository],
+) -> None:
+    from app.db.crud.skill_evolution import SkillEvolutionRepository
+    from app.service.evolution.retry import EvolutionRetryService
+
+    database, repository = state
+    states = SkillEvolutionRepository(database)
+    saved = await states.initialize("run-apply", {"reports": []})
+    await states.save_checkpoint(
+        "run-apply",
+        {
+            "cluster_map": {"cluster-apply": {"source_probe_ids": ["frozen-probe"]}},
+            "source_reports": [
+                {
+                    "probe_id": "frozen-probe",
+                    "session_id": "frozen-session",
+                    "probe_description": "frozen description",
+                    "probe_analysis": "frozen analysis",
+                    "from_bad_cases": [{"bad_case_id": "frozen-case"}],
+                }
+            ],
+        },
+        expected_revision=saved.revision,
+    )
+
+    class NoLiveReads:
+        async def list_rows_by_ids(self, ids: Sequence[str]) -> tuple[ProbeHitRow, ...]:
+            raise AssertionError("must not reread mutable upstream probes")
+
+    candidates = CandidateDouble(repository)
+    apply = EvolutionApplyService(
+        repository,
+        candidates,  # type: ignore[arg-type]
+        NoLiveReads(),
+        skill_states=states,
+    )
+    retry = EvolutionRetryService(
+        repository,
+        candidates,  # type: ignore[arg-type]
+        JobCapture(),  # type: ignore[arg-type]
+        probes=NoLiveReads(),
+        skill_states=states,
+    )
+    run = await repository.get_run("run-apply")
+    round_ = await repository.get_round("round-apply")
+    assert run is not None and round_ is not None
+    for service in (apply, retry):
+        trace = await service._trace(run, round_)
+        assert trace.probes == ("frozen-probe",)
+        assert trace.bad_cases == ("frozen-case",)
+        assert trace.sources[0].session_id == "frozen-session"
+        assert trace.analysis == "frozen analysis"
+
+
+async def test_real_run_never_falls_back_to_synthetic_final_after_restart(
+    state: tuple[Database, EvolutionRepository],
+) -> None:
+    database, repository = state
+    async with database.transaction() as session:
+        await session.execute(
+            update(evolution_rounds)
+            .where(
+                evolution_rounds.c.id == "round-apply",
+            )
+            .values(status="rejected")
+        )
+        await session.execute(
+            update(evolution_runs)
+            .where(
+                evolution_runs.c.id == "run-apply",
+            )
+            .values(eval_config={"skillEvolution": "real"}, progress_unit=5)
+        )
+    service = EvolutionFinalizeService(repository, WorkspaceDouble())  # type: ignore[arg-type]
+    with pytest.raises(RunBlocked) as error:
+        await service.handle(_job("evolution_finalize"))
+    assert error.value.error_stage == "final_eval"
+    assert await repository.get_final("run-apply") is None
+
+
+async def test_legacy_skill_keeps_legacy_final_when_real_server_is_enabled(
+    state: tuple[Database, EvolutionRepository],
+) -> None:
+    database, repository = state
+    async with database.transaction() as session:
+        await session.execute(
+            update(evolution_rounds)
+            .where(
+                evolution_rounds.c.id == "round-apply",
+            )
+            .values(status="rejected")
+        )
+        await session.execute(
+            update(evolution_runs)
+            .where(
+                evolution_runs.c.id == "run-apply",
+            )
+            .values(progress_unit=5)
+        )
+
+    def forbidden_gateway(run: Any) -> Any:
+        raise AssertionError("legacy run must not use newly enabled real evaluation")
+
+    service = EvolutionFinalizeService(
+        repository,
+        WorkspaceDouble(),  # type: ignore[arg-type]
+        gateway_for_run=forbidden_gateway,
+    )
+    result = await service.handle(_job("evolution_finalize"))
+    assert result["finalized"] is True
+    final = await repository.get_final("run-apply")
+    assert final is not None and not final.verdict
+
+
+@pytest.mark.parametrize("final_phase", [True, False])
+async def test_ambiguous_submission_requires_reconciliation_not_new_attempt(
+    state: tuple[Database, EvolutionRepository],
+    final_phase: bool,
+) -> None:
+    from app.db.crud.skill_evolution import SkillEvolutionRepository
+    from app.service.evolution.retry import EvolutionRetryService
+    from app.third_party_api.evaluation.models import AmbiguousEvaluationSubmission
+
+    database, repository = state
+    async with database.transaction() as session:
+        await session.execute(
+            update(evolution_rounds)
+            .where(
+                evolution_rounds.c.id == "round-apply",
+            )
+            .values(
+                status="rejected" if final_phase else "evaluating",
+                eval_status="pending",
+                eval_external_id=None,
+            )
+        )
+        await session.execute(
+            update(evolution_runs)
+            .where(
+                evolution_runs.c.id == "run-apply",
+            )
+            .values(eval_config={"skillEvolution": "real"}, progress_unit=5 if final_phase else 4)
+        )
+    states = SkillEvolutionRepository(database)
+    await states.initialize("run-apply", {"files": {"SKILL.md": "base"}})
+    requests = []
+
+    class Gateway:
+        async def submit(self, request: Any) -> Any:
+            requests.append(request)
+            raise AmbiguousEvaluationSubmission("provider accepted status is unknown")
+
+    class Workspaces(WorkspaceDouble):
+        async def publish_skill_snapshot(self, path: Path, *, branch: str, commit: str) -> str:
+            return branch
+
+    with pytest.raises(RunBlocked) as error:
+        if final_phase:
+            service = EvolutionFinalizeService(
+                repository,
+                Workspaces(),  # type: ignore[arg-type]
+                gateway_for_run=lambda run: Gateway(),  # type: ignore[arg-type,return-value]
+                skill_states=states,
+            )
+            await service.handle(_job("evolution_finalize"))
+        else:
+            submitter = EvolutionEvalSubmitter(
+                repository,
+                lambda run: Gateway(),  # type: ignore[arg-type,return-value]
+                events=None,
+            )
+            run = await repository.get_run("run-apply")
+            round_ = await repository.get_round("round-apply")
+            assert run is not None and round_ is not None
+            await submitter.submit(run, round_)
+    assert error.value.retryable is False
+    assert error.value.error_stage.endswith("_submission_ambiguous")
+    retry = EvolutionRetryService(
+        repository,
+        CandidateDouble(repository),  # type: ignore[arg-type]
+        JobCapture(),  # type: ignore[arg-type]
+    )
+    with pytest.raises(AppError) as admission:
+        await retry.request_retry("run-apply", None)
+    assert admission.value.code == ErrorCode.RUN_NOT_RETRYABLE
+    with pytest.raises(RunBlocked) as replay:
+        await retry.handle(_job("evolution_retry"))
+    assert replay.value.retryable is False
+    assert len(requests) == 1
+    saved = await states.get("run-apply")
+    assert saved is not None and "final_evaluation" not in saved.checkpoint
+    round_ = await repository.get_round("round-apply")
+    assert round_ is not None and round_.eval_attempts == 1

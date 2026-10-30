@@ -4434,7 +4434,8 @@
               "evaluating",
               "completed",
               "failed",
-              "timeout"
+              "timeout",
+              "skipped"
             ],
             "title": "Status",
             "type": "string"

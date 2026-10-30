@@ -68,6 +68,8 @@ class EvolutionLaunchService:
         runs: EvolutionRepository,
         jobs: JobRunner,
         events: EvolutionRunEventService | None = None,
+        *,
+        real_skill_enabled: bool = False,
     ) -> None:
         """Bind launch collaborators for both run modes."""
         self._targets = targets
@@ -75,6 +77,7 @@ class EvolutionLaunchService:
         self._runs = runs
         self._jobs = jobs
         self._events = events
+        self._real_skill_enabled = real_skill_enabled
 
     async def request_run(
         self,
@@ -181,11 +184,16 @@ class EvolutionLaunchService:
         Returns:
             Column values for one `preparing` run row.
         """
+        eval_config = _snapshot_eval(body.eval)
+        # This is a server-owned admission marker, never a client-selected mode.
+        eval_config.pop("skillEvolution", None)
+        if self._real_skill_enabled and body.mode == "full" and query.target_type == "skill":
+            eval_config["skillEvolution"] = "real"
         return {
             "title": f"{query.target_name} {query.target_version} 自进化",
             "mode": body.mode,
             "engine_key": body.engine_key or body.mode,
-            "eval_config": _snapshot_eval(body.eval),
+            "eval_config": eval_config,
             "target_config_id": config.id,
             "target_type": query.target_type,
             "target_name": query.target_name,

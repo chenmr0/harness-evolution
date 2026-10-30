@@ -61,6 +61,9 @@ function statusLabel(round: StepRound): string {
   if (round.push.status === "skipped") {
     return "本地候选（未推送）";
   }
+  if (round.eval.status === "skipped") {
+    return round.status === "rejected" ? "未接纳（未执行评测）" : "已跳过（未执行评测）";
+  }
   if (round.eval.status === "timeout") {
     return "评测超时";
   }

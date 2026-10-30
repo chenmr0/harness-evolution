@@ -29,6 +29,7 @@ from app.db.models.evolution import (
     record_from_probe_cluster,
     record_from_probe_cluster_link,
 )
+from app.db.models.skill_evolution import skill_evolution_state
 from app.db.models.users import users
 from app.service.evolution.state import StageConflict, validate_transition
 from app.utils.ids import new_id
@@ -280,14 +281,30 @@ class EvolutionRepository:
         branch_name: str | None,
         workspace_path: str | None,
         stats: Mapping[str, Any],
+        skipped_rounds: int = 0,
     ) -> EvolutionRunRecord:
         """Persist the immutable workspace snapshot and prepared run status."""
         if status not in {"running", "completed"}:
             raise ValueError("prepared runs must be running or completed")
         if progress_unit != 4:
             raise ValueError("prepared runs must finish the severity step")
+        if skipped_rounds < 0:
+            raise ValueError("skipped round count must be nonnegative")
+        progress_unit += skipped_rounds
         now = now_shanghai()
         async with self._database.transaction() as session:
+            actual_skipped = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(evolution_rounds)
+                    .where(
+                        evolution_rounds.c.run_id == run_id,
+                        evolution_rounds.c.status == "skipped",
+                    ),
+                )
+            ).scalar_one()
+            if actual_skipped != skipped_rounds:
+                raise ValueError("skipped round count differs from persisted rounds")
             result = cast(
                 CursorResult[Any],
                 await session.execute(
@@ -295,6 +312,7 @@ class EvolutionRepository:
                     .where(
                         evolution_runs.c.id == run_id,
                         evolution_runs.c.status.in_(("preparing", "running")),
+                        evolution_runs.c.progress_unit <= progress_unit,
                     )
                     .values(
                         status=status,
@@ -1416,6 +1434,50 @@ class EvolutionRepository:
                     select(evolution_rounds.c.run_id).where(evolution_rounds.c.id == round_id),
                 )
             ).scalar_one()
+            state = (
+                (
+                    await session.execute(
+                        select(skill_evolution_state)
+                        .where(
+                            skill_evolution_state.c.run_id == run_id,
+                        )
+                        .with_for_update(),
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if state is not None:
+                patch: Any = (
+                    await session.execute(
+                        select(evolution_rounds.c.patch).where(
+                            evolution_rounds.c.id == round_id,
+                        )
+                    )
+                ).scalar_one()
+                files = patch.get("files") if isinstance(patch, dict) else None
+                if (
+                    not isinstance(files, dict)
+                    or not files
+                    or any(
+                        not isinstance(path, str) or not isinstance(content, str)
+                        for path, content in files.items()
+                    )
+                ):
+                    raise ValueError("accepted Skill patch requires a validated file snapshot")
+                checkpoint = deepcopy(dict(state["checkpoint"]))
+                checkpoint["best_files"] = deepcopy(files)
+                await session.execute(
+                    update(skill_evolution_state)
+                    .where(
+                        skill_evolution_state.c.run_id == run_id,
+                    )
+                    .values(
+                        checkpoint=checkpoint,
+                        revision=state["revision"] + 1,
+                        updated_at=finished_at,
+                    )
+                )
             await session.execute(
                 update(evolution_runs)
                 .where(evolution_runs.c.id == run_id)
@@ -1427,6 +1489,56 @@ class EvolutionRepository:
                 ),
             )
         return await self._required_round(round_id)
+
+    async def reject_invalid_patch(
+        self,
+        round_id: str,
+        *,
+        reason: str,
+        finished_at: datetime,
+    ) -> EvolutionRoundRecord:
+        """Reject only a validated invalid/no-op proposal, never a provider failure."""
+        if reason not in ("invalid_patch", "noop_patch"):
+            raise ValueError("invalid patch rejection requires a safe reason code")
+        async with self._database.transaction() as session:
+            result = cast(
+                CursorResult[Any],
+                await session.execute(
+                    update(evolution_rounds)
+                    .where(
+                        evolution_rounds.c.id == round_id,
+                        evolution_rounds.c.status == "patching",
+                    )
+                    .values(
+                        status="rejected",
+                        accepted=False,
+                        eval_status="skipped",
+                        eval_error=reason,
+                        error_message=reason,
+                        finished_at=finished_at,
+                        commit_hash=None,
+                        commit_message=None,
+                    ),
+                ),
+            )
+            if result.rowcount != 1:
+                raise StageConflict(
+                    status_code=409,
+                    current=0,
+                    target=1,
+                    reason="only patching rounds can reject invalid proposals",
+                )
+            run_id: str = (
+                await session.execute(
+                    select(evolution_rounds.c.run_id).where(evolution_rounds.c.id == round_id),
+                )
+            ).scalar_one()
+            await session.execute(
+                update(evolution_runs)
+                .where(evolution_runs.c.id == run_id)
+                .values(progress_unit=evolution_runs.c.progress_unit + 1),
+            )
+        return await self._required_round(round_id, expected_status="rejected")
 
     async def reject_round(
         self,

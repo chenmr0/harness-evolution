@@ -17,6 +17,7 @@ from pydantic import Field
 
 from app.db.crud.evolution import EvolutionRepository
 from app.db.crud.probe_query import ProbeHitRow, ProbeQueryRepository
+from app.db.crud.skill_evolution import SkillEvolutionRepository
 from app.db.models.evolution import (
     EvolutionRoundRecord,
     EvolutionRunRecord,
@@ -53,7 +54,7 @@ RoundStatus = Literal[
     "failed",
 ]
 RoundPushStatus = Literal["pending", "pushing", "succeeded", "skipped", "failed"]
-RoundEvalStatus = Literal["pending", "evaluating", "completed", "failed", "timeout"]
+RoundEvalStatus = Literal["pending", "evaluating", "completed", "failed", "timeout", "skipped"]
 _CLUSTER_TYPES: tuple[str, ...] = ("model", "prompt", "error")
 
 
@@ -295,10 +296,17 @@ EvolutionStep = (
 class EvolutionStageService:
     """Project one run's persisted stage data through shared readiness rules."""
 
-    def __init__(self, runs: EvolutionRepository, probes: ProbeQueryRepository) -> None:
+    def __init__(
+        self,
+        runs: EvolutionRepository,
+        probes: ProbeQueryRepository,
+        *,
+        skill_states: SkillEvolutionRepository | None = None,
+    ) -> None:
         """Bind the service to its run and probe read repositories."""
         self._runs = runs
         self._probes = probes
+        self._skill_states = skill_states
 
     async def step(self, run_id: str, key: StepKey) -> EvolutionStep:
         """Return one readable step or fail with the documented 404 codes.
@@ -350,13 +358,31 @@ class EvolutionStageService:
         Returns:
             The key-discriminated step envelope with its payload.
         """
-        links = await self._runs.list_cluster_probes(run.id)
-        probe_ids = tuple(dict.fromkeys(link.probe_id for link in links))
-        grouped = await self._probe_rows(probe_ids)
-        cluster_of_probe = {link.probe_id: link.probe_cluster_id for link in links}
+        state = await self._skill_states.get(run.id) if self._skill_states is not None else None
         probes_of_cluster: dict[str, list[str]] = OrderedDict()
-        for link in links:
-            probes_of_cluster.setdefault(link.probe_cluster_id, []).append(link.probe_id)
+        if state is not None:
+            reports = {report["probe_id"]: report for report in state.input_snapshot["reports"]}
+            reports.update(
+                {
+                    report["probe_id"]: report
+                    for report in state.checkpoint.get("source_reports", [])
+                }
+            )
+            for cluster in clusters:
+                item = state.checkpoint["cluster_map"].get(cluster.probe_cluster_id, {})
+                probes_of_cluster[cluster.probe_cluster_id] = list(item.get("source_probe_ids", []))
+            cluster_of_probe = {pid: cid for cid, ids in probes_of_cluster.items() for pid in ids}
+            selected_reports = (
+                state.input_snapshot["reports"] if key == "input" else list(reports.values())
+            )
+            grouped = _snapshot_rows(run, list(selected_reports))
+        else:
+            links = await self._runs.list_cluster_probes(run.id)
+            probe_ids = tuple(dict.fromkeys(link.probe_id for link in links))
+            grouped = await self._probe_rows(probe_ids)
+            cluster_of_probe = {link.probe_id: link.probe_cluster_id for link in links}
+            for link in links:
+                probes_of_cluster.setdefault(link.probe_cluster_id, []).append(link.probe_id)
         builders: dict[StepKey, Callable[[], Awaitable[EvolutionStep]]] = {
             "input": lambda: self._input(run, clusters, cluster_of_probe, grouped),
             "clusters": lambda: self._clusters(run, clusters, probes_of_cluster, grouped),
@@ -438,7 +464,8 @@ class EvolutionStageService:
         cases: set[str] = set()
         for probe_id in probe_ids:
             for row in grouped.get(probe_id, []):
-                cases.add(row.bad_case_id)
+                if row.bad_case_id:
+                    cases.add(row.bad_case_id)
         return len(cases)
 
     def _probe_items(
@@ -459,7 +486,7 @@ class EvolutionStageService:
         for probe_id in probe_ids:
             rows = grouped.get(probe_id, [])
             if rows:
-                item = probe_row_of(rows)
+                item = _project_probe(rows)
                 if item is not None:
                     items.append(item)
         return items
@@ -485,7 +512,7 @@ class EvolutionStageService:
         distribution = AttributeStats()
         items: list[StepInputRow] = []
         for probe_id, rows in grouped.items():
-            item = probe_row_of(rows)
+            item = _project_probe(rows)
             if item is None:
                 continue
             items.append(
@@ -496,14 +523,21 @@ class EvolutionStageService:
             distribution.model += item.attribute_type == "model"
             distribution.prompt += item.attribute_type == "prompt"
             distribution.error += item.attribute_type == "error"
-        bad_cases = {row.bad_case_id for rows in grouped.values() for row in rows}
+        bad_cases = {
+            row.bad_case_id for rows in grouped.values() for row in rows if row.bad_case_id
+        }
         analyzed = {
             row.bad_case_id
             for rows in grouped.values()
             for row in rows
-            if row.analysis_status == "analyzed_issue"
+            if row.analysis_status == "analyzed_issue" and row.bad_case_id
         }
-        sessions = {row.probe_session_id for rows in grouped.values() for row in rows}
+        sessions = {
+            row.probe_session_id
+            for rows in grouped.values()
+            for row in rows
+            if row.probe_session_id
+        }
         probes = len(items)
         return EvolutionStepInput(
             **self._shell(run, len(clusters), "input"),
@@ -733,7 +767,7 @@ class EvolutionStageService:
                 if round_.candidate_ref is not None
                 else None
             ),
-            patch=StepRoundPatch.model_validate(patch) if isinstance(patch, dict) else None,
+            patch=_project_patch(patch),
             push=StepRoundPush(
                 status=cast(RoundPushStatus, round_.push_status),
                 attempts=round_.push_attempts,
@@ -814,3 +848,51 @@ class EvolutionStageService:
             **self._shell(run, len(clusters), "final"),
             payload=payload,
         )
+
+
+def _snapshot_rows(
+    run: EvolutionRunRecord, reports: list[dict[str, Any]]
+) -> dict[str, list[ProbeHitRow]]:
+    """Adapt frozen provenance to existing DTO builders without upstream reads or writes."""
+    grouped: dict[str, list[ProbeHitRow]] = OrderedDict()
+    for report in reports:
+        # Empty case identity keeps a case-less feedback probe visible, never counted as a case.
+        cases = report.get("from_bad_cases", []) or [{"bad_case_id": ""}]
+        grouped[report["probe_id"]] = [
+            ProbeHitRow(
+                bad_case_id=case["bad_case_id"],
+                analysis_status="analyzed_issue",
+                probe_id=report["probe_id"],
+                probe_session_id=report.get("session_id") or "",
+                probe_type="skill",
+                probe_object=report.get("probe_object") or run.target_name,
+                object_version=report.get("object_version") or run.target_version,
+                attribute_type=report["attribute_type"],
+                probe_description=report["probe_description"],
+                probe_analysis=report.get("probe_analysis", ""),
+                session_title=report.get("session_title"),
+                case_agent_model=report.get("model"),
+                session_model=None,
+                probe_started_at=None,
+            )
+            for case in cases
+        ]
+    return grouped
+
+
+def _project_probe(rows: list[ProbeHitRow]) -> ProbePreviewItem | None:
+    """Preserve the existing ProbeRow contract for feedback without source bad cases."""
+    item = probe_row_of(rows)
+    if item is not None:
+        item.source_bad_case_ids = [case for case in item.source_bad_case_ids if case]
+    return item
+
+
+def _project_patch(patch: Any) -> StepRoundPatch | None:
+    """Render actual Skill diff lines through the unchanged legacy preview contract."""
+    if not isinstance(patch, dict):
+        return None
+    if "changes" in patch:
+        edit = patch.get("edit_patch", {})
+        return StepRoundPatch(file=patch["file"], lines=edit.get("unified_diff", "").splitlines())
+    return StepRoundPatch.model_validate(patch)

@@ -272,6 +272,7 @@ def test_openapi_exposes_implemented_identity_and_error_contracts() -> None:
         "completed",
         "failed",
         "timeout",
+        "skipped",
     ]
     assert target_collection["get"]["responses"]["200"]["content"]["application/json"][
         "schema"

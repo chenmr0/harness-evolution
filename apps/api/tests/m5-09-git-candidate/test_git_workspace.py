@@ -1143,3 +1143,57 @@ def test_workspace_cleanup_keeps_active_and_newest_inactive_runs(tmp_path: Path)
     assert len(removed) == 2
     assert created[1] in removed
     assert created[2] in removed
+
+
+async def test_skill_multifile_candidate_uses_branch_not_tag(
+    tmp_path: Path,
+    remote_repo: tuple[Path, Path, str],
+) -> None:
+    """Skill replacement/deletion publication does not create a candidate tag."""
+    bare, _, base = remote_repo
+    run = _run(str(bare), base)
+    manager = GitWorkspaceManager(repos_root=tmp_path / "repos", workspaces_root=tmp_path / "work")
+    prepared = await manager.prepare(run)
+    ref = f"evo-candidate/{prepared.branch.removeprefix('evo/')}/r1"
+    patch = Patch(
+        file="skills/deep-research/SKILL.md",
+        changes={
+            "skills/deep-research/SKILL.md": "# Revised\n",
+            "skills/deep-research/reference.md": "Evidence\n",
+        },
+    )
+    candidate = await manager.create_candidate(
+        prepared,
+        run_branch=prepared.branch,
+        candidate_ref=ref,
+        patch=patch,
+        message=f"candidate\n\nHarness-Run-Id: {run.id}",
+        expected_run_id=run.id,
+    )
+    await manager.push_candidate(candidate, expected_remote_commit=None)
+    assert _git(bare, "rev-parse", f"refs/heads/{ref}") == candidate.commit
+    assert _git(bare, "tag", "--list", ref) == ""
+    assert (prepared.path / patch.file).read_text() == "# Revised\n"
+    snapshot = f"evo-snapshot/{run.id}/baseline"
+    await manager.publish_skill_snapshot(prepared.path, branch=snapshot, commit=base)
+    await manager.publish_skill_snapshot(prepared.path, branch=snapshot, commit=base)
+    with pytest.raises(GitOperationError, match="immutable"):
+        await manager.publish_skill_snapshot(
+            prepared.path, branch=snapshot, commit=candidate.commit
+        )
+    await manager.reject_candidate(candidate, run_branch=prepared.branch)
+    assert _git(bare, "branch", "--list", ref) == ""
+    assert _git(bare, "rev-parse", f"refs/heads/{snapshot}") == base
+
+
+def test_skill_multifile_patch_rejects_symlinks(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.write_text("unchanged")
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    (workspace / "SKILL.md").symlink_to(outside)
+    with pytest.raises(GitOperationError, match="symlink"):
+        GitWorkspaceManager._write_patch(
+            workspace, Patch(file="SKILL.md", changes={"SKILL.md": "bad"})
+        )
+    assert outside.read_text() == "unchanged"

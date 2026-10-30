@@ -12,7 +12,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import NoReturn
+from typing import Any, NoReturn
 from urllib.parse import urlsplit
 
 from app.db.crud.evolution import EvolutionRepository
@@ -26,6 +26,7 @@ from app.service.evolution.events import (
     EvolutionRunEventType,
 )
 from app.service.evolution.git_failures import classify_git_failure
+from app.service.evolution.skill_core import SkillPatchRejected
 from app.service.evolution.state import StageConflict
 from app.third_party_api.git.workspace import (
     CandidateWorkspace,
@@ -134,7 +135,11 @@ def build_accepted_message(
                 f"Harness-Verdict: accepted "
                 f"({candidate_score:.1f} vs {current_score:.1f}, {delta:+.1f})"
             ),
-            "Harness-Decision-Rule: external-verdict",
+            (
+                "Harness-Decision-Rule: strict-case-total-score-mean"
+                if run.eval_config.get("skillEvolution") == "real"
+                else "Harness-Decision-Rule: external-verdict"
+            ),
         ),
     )
     return "\n\n".join((subject, *sections, "---\n" + trailers))
@@ -172,6 +177,8 @@ class EvolutionCandidateService:
         workspaces: GitWorkspaceManager,
         *,
         events: EvolutionRunEventService | None = None,
+        skill_core: Any = None,
+        skill_states: Any = None,
         web_base_url: str | None = None,
         push_interval_seconds: float = 5.0,
         push_attempts: int = 3,
@@ -180,6 +187,8 @@ class EvolutionCandidateService:
     ) -> None:
         """Bind durable state, git operations, timing, and trace links."""
         self._runs = runs
+        self._skill_core = skill_core
+        self._skill_states = skill_states
         self._workspaces = workspaces
         self._events = events
         self._web_base_url = web_base_url
@@ -199,13 +208,89 @@ class EvolutionCandidateService:
         """Create, commit, and push one candidate with bounded immediate retries."""
         if round_.status in {"evaluating", "deciding", "accepted", "rejected", "skipped"}:
             return round_
+        if run.target_type == "skill" and self._skill_core is None:
+            existing_state = (
+                await self._skill_states.get(run.id) if self._skill_states is not None else None
+            )
+            if run.eval_config.get("skillEvolution") == "real" or existing_state is not None:
+                raise ValueError("Real Skill model is unavailable; refusing placeholder fallback")
         prepared = _prepared_workspace(run)
         current = await self._runs.mark_round_patching(
             round_.id,
             started_at=self._now(),
         )
-        patch = placeholder_patch(run, current.seq)
-        candidate_ref = f"{prepared.branch}/candidate/r{current.seq}"
+        patch_payload = None
+        if (
+            run.target_type == "skill"
+            and self._skill_core is not None
+            and (
+                run.eval_config.get("skillEvolution") == "real"
+                or (
+                    self._skill_states is not None
+                    and await self._skill_states.get(run.id) is not None
+                )
+            )
+        ):
+            if self._skill_states is None:
+                raise ValueError("Skill state repository is missing")
+            state = await self._skill_states.get(run.id)
+            if state is None:
+                raise ValueError("Skill input snapshot is missing")
+            from app.service.evolution.skill_identity import skill_identity
+
+            checkpoint = state.checkpoint
+            if checkpoint.get("identity") != skill_identity(self._skill_core):
+                raise ValueError("Skill model or strategy changed since preparation")
+            cluster = checkpoint["cluster_map"][current.probe_cluster_id]
+            reports = [
+                item
+                for item in checkpoint["plan"]["canonical_reports"]
+                if item["probe_id"] in cluster["probe_ids"]
+            ]
+            try:
+                skill_patch = await self._skill_core.patch(
+                    cluster, reports, dict(checkpoint["best_files"])
+                )
+            except SkillPatchRejected as exc:
+                # Provider transport failures are not caught: only invalid proposals reject.
+                return await self._runs.reject_invalid_patch(
+                    current.id,
+                    reason=exc.reason,
+                    finished_at=self._now(),
+                )
+            prefix = "" if run.sub_dir in ("", ".") else run.sub_dir.rstrip("/") + "/"
+            changes = {prefix + name: content for name, content in skill_patch.changes.items()}
+            patch = Patch(file=next(iter(changes)), changes=changes)
+            accepted = [
+                item
+                for item in await self._runs.list_rounds(run.id)
+                if item.status == "accepted" and item.commit_hash
+            ]
+            baseline_commit = (
+                accepted[-1].commit_hash if accepted else None
+            ) or prepared.base_commit
+            baseline_ref = f"evo-snapshot/{run.id}/r{current.seq}-baseline"
+            await self._workspaces.publish_skill_snapshot(
+                prepared.path,
+                branch=baseline_ref,
+                commit=baseline_commit,
+            )
+            patch_payload = {
+                "file": patch.file,
+                "changes": changes,
+                "files": skill_patch.files,
+                "edit_patch": skill_patch.edit_patch,
+                "sha256": patch.sha256,
+                "baseline_ref": baseline_ref,
+                "baseline_commit": baseline_commit,
+            }
+        else:
+            patch = placeholder_patch(run, current.seq)
+        candidate_ref = (
+            f"evo-candidate/{prepared.branch.removeprefix('evo/')}/r{current.seq}"
+            if patch.changes is not None
+            else f"{prepared.branch}/candidate/r{current.seq}"
+        )
         message = build_candidate_message(
             run,
             round_seq=current.seq,
@@ -234,7 +319,7 @@ class EvolutionCandidateService:
             candidate_ref=candidate.ref,
             candidate_commit=candidate.commit,
             candidate_message=candidate.message,
-            patch={"file": patch.file, "lines": list(patch.lines)},
+            patch=patch_payload or {"file": patch.file, "lines": list(patch.lines)},
         )
         await self._record(
             run.id,
@@ -243,7 +328,10 @@ class EvolutionCandidateService:
             message=f"候选提交已创建：第 {current.seq} 轮",
             round_id=current.id,
             job_id=job_id,
-            payload={"files": [patch.file], "patchHash": f"sha256:{patch.sha256}"},
+            payload={
+                "files": list(patch.changes or {patch.file: None}),
+                "patchHash": f"sha256:{patch.sha256}",
+            },
         )
 
         if not self._workspaces.push_enabled:
@@ -871,6 +959,8 @@ def _patch_file(round_: EvolutionRoundRecord) -> str:
 def _patch_hash(round_: EvolutionRoundRecord) -> str:
     """Recompute the stored patch digest for accepted-message reproduction."""
     file = _patch_file(round_)
+    if isinstance(round_.patch, Mapping) and isinstance(round_.patch.get("changes"), dict):
+        return Patch(file="SKILL.md", changes=dict(round_.patch["changes"])).sha256
     raw_lines = round_.patch.get("lines") if isinstance(round_.patch, Mapping) else None
     lines = (
         tuple(line for line in raw_lines if isinstance(line, str))

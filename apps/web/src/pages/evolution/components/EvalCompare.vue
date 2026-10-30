@@ -20,12 +20,14 @@ const improved = computed(
   () =>
     props.evaluation.candidate !== null &&
     props.evaluation.current !== null &&
-    props.evaluation.candidate >= props.evaluation.current,
+    props.evaluation.candidate > props.evaluation.current,
 );
 const outcome = computed(() => {
   switch (props.evaluation.status) {
     case "pending":
       return "等待评测启动";
+    case "skipped":
+      return "未执行评测，本轮已跳过或候选补丁未通过校验";
     case "evaluating":
       return "评测中，等待 candidate 得分";
     case "failed":

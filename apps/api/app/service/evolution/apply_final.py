@@ -1,28 +1,34 @@
-"""Apply placeholder evaluation verdicts and finalize an evolution run."""
+"""Apply strict evaluation improvements and independently finalize Skill runs."""
 
 # ruff: noqa: RUF001
 
 from __future__ import annotations
 
 import logging
-import math
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol
 
 from app.db.crud.evolution import EvolutionRepository
 from app.db.crud.probe_query import ProbeHitRow
+from app.db.crud.skill_evolution import SkillCheckpointConflict, SkillEvolutionRepository
 from app.db.models.evolution import EvolutionRoundRecord, EvolutionRunRecord
 from app.db.models.jobs import JobRunRecord
-from app.service.evolution.advance import build_candidate_trace
+from app.service.evolution.advance import build_candidate_trace, build_frozen_candidate_trace
 from app.service.evolution.backoff import next_retry_at
-from app.service.evolution.engine.contracts import EvalResult, RunBlocked
+from app.service.evolution.engine.contracts import EvalRequest, EvalResult, RunBlocked
+from app.service.evolution.eval_poller import GatewayResolver
 from app.service.evolution.events import EvolutionRunEventService
 from app.service.evolution.git_candidate import (
     CandidateTrace,
     EvolutionCandidateService,
 )
 from app.service.evolution.git_failures import classify_git_failure
+from app.third_party_api.evaluation.models import (
+    AmbiguousEvaluationSubmission,
+    InvalidEvaluationEvidence,
+)
 from app.third_party_api.git.workspace import (
     GitOperationError,
     GitWorkspaceManager,
@@ -34,6 +40,10 @@ from app.utils.time import now_shanghai
 logger = logging.getLogger(__name__)
 
 
+class FinalEvaluationTerminalError(ValueError):
+    """A terminal external attempt may be replaced by an explicitly retried attempt."""
+
+
 class ProbeSourceReader(Protocol):
     """Load complete source rows for an evaluated round trace."""
 
@@ -42,7 +52,7 @@ class ProbeSourceReader(Protocol):
 
 
 class EvolutionApplyService:
-    """Apply one completed placeholder evaluation through the real candidate boundary."""
+    """Apply one completed evaluation through the candidate publication boundary."""
 
     def __init__(
         self,
@@ -51,6 +61,7 @@ class EvolutionApplyService:
         probes: ProbeSourceReader,
         *,
         events: EvolutionRunEventService | None = None,
+        skill_states: SkillEvolutionRepository | None = None,
         now: Any = now_shanghai,
     ) -> None:
         """Bind durable evaluation, candidate publication, and trace evidence."""
@@ -58,6 +69,7 @@ class EvolutionApplyService:
         self._candidates = candidates
         self._probes = probes
         self._events = events
+        self._skill_states = skill_states
         self._now = now
 
     async def handle(self, job: JobRunRecord) -> Mapping[str, Any]:
@@ -93,7 +105,7 @@ class EvolutionApplyService:
             raise ValueError("apply job requires a completed durable evaluation result")
         result = EvalResult.from_payload(round_.eval_result)
         trace = await self._trace(run, round_)
-        accepted = result.external_verdict == "accept"
+        accepted = result.candidate_score > result.current_score
         reason = decision_sentence(result, accepted=accepted)
         if accepted:
             decided = await self._candidates.accept(
@@ -143,6 +155,14 @@ class EvolutionApplyService:
             for link in await self._runs.list_cluster_probes(run.id)
             if link.probe_cluster_id == cluster.probe_cluster_id
         )
+        state = await self._skill_states.get(run.id) if self._skill_states is not None else None
+        if state is not None:
+            return build_frozen_candidate_trace(
+                state,
+                cluster.probe_cluster_id,
+                cluster.probe_cluster_description,
+                links,
+            )
         rows = await self._probes.list_rows_by_ids(links)
         return build_candidate_trace(
             cluster.probe_cluster_id,
@@ -152,8 +172,19 @@ class EvolutionApplyService:
         )
 
 
+class FeedbackAdvancer(Protocol):
+    """Persist another validation iteration before the independent final test."""
+
+    async def advance_if_needed(
+        self,
+        run: EvolutionRunRecord,
+        rounds: Sequence[EvolutionRoundRecord],
+    ) -> bool:
+        """Return whether another durable iteration is now pending."""
+
+
 class EvolutionFinalizeService:
-    """Build the placeholder final, publish the run branch, and finish the run."""
+    """Reevaluate baseline and accepted best, publish the branch, and finish the run."""
 
     def __init__(
         self,
@@ -161,6 +192,11 @@ class EvolutionFinalizeService:
         workspaces: GitWorkspaceManager,
         *,
         events: EvolutionRunEventService | None = None,
+        gateway_for_run: GatewayResolver | None = None,
+        feedback: FeedbackAdvancer | None = None,
+        skill_states: SkillEvolutionRepository | None = None,
+        poll_interval: timedelta = timedelta(minutes=5),
+        timeout: timedelta = timedelta(hours=2),
         now: Any = now_shanghai,
     ) -> None:
         """Bind durable finals, git publication, and event recording."""
@@ -168,6 +204,11 @@ class EvolutionFinalizeService:
         self._workspaces = workspaces
         self._events = events
         self._now = now
+        self._gateway_for_run = gateway_for_run
+        self._feedback = feedback
+        self._skill_states = skill_states
+        self._poll_interval = poll_interval
+        self._timeout = timeout
 
     async def handle(self, job: JobRunRecord) -> Mapping[str, Any]:
         """Finalize only after every round reached a terminal decision."""
@@ -205,8 +246,57 @@ class EvolutionFinalizeService:
                 "reason": "rounds are still active",
             }
         retry_attempts = _job_retry_attempts(job)
+        result = None
+        real_skill = run.eval_config.get("skillEvolution") == "real"
+        if real_skill:
+            try:
+                if self._gateway_for_run is None or self._skill_states is None:
+                    raise ValueError("real Skill final evaluation dependencies are unavailable")
+                if self._feedback is not None and await self._feedback.advance_if_needed(
+                    run, rounds
+                ):
+                    return {
+                        "runId": run.id,
+                        "finalized": False,
+                        "reason": "validation feedback scheduled another iteration",
+                    }
+                result = await self._evaluate_final(run, rounds)
+            except Exception as exc:
+                if isinstance(exc, FinalEvaluationTerminalError) and self._skill_states is not None:
+                    state = await self._skill_states.get(run.id)
+                    if state is not None:
+                        previous = dict(state.checkpoint.get("final_evaluation", {}))
+                        await self._save_final_state(
+                            run.id,
+                            {
+                                "attempt": int(previous.get("attempt", 0)) + 1,
+                                "previous_external_id": previous.get("external_id"),
+                            },
+                        )
+                error_stage = (
+                    "final_eval_submission_ambiguous"
+                    if isinstance(exc, AmbiguousEvaluationSubmission)
+                    else "final_eval"
+                )
+                message = sanitize_message(f"final evaluation failed: {exc}", limit=2_000)
+                await self._runs.mark_blocked(
+                    run.id,
+                    stage="eval",
+                    message=message,
+                    error_stage=error_stage,
+                    next_retry_at=None,
+                    retry_attempts=retry_attempts,
+                )
+                raise RunBlocked(
+                    message,
+                    stage="eval",
+                    error_stage=error_stage,
+                    retryable=False,
+                ) from None
+            if result is None:
+                return {"runId": run.id, "finalized": False, "reason": "final evaluation pending"}
         try:
-            final = await self._runs.write_final(_final_values(run, rounds))
+            final = await self._runs.write_final(_final_values(run, rounds, result=result))
             prepared = _prepared_workspace(run)
         except Exception as exc:
             message = sanitize_message(str(exc), limit=2_000)
@@ -278,6 +368,102 @@ class EvolutionFinalizeService:
             "pushStatus": push_status,
         }
 
+    async def _save_final_state(self, run_id: str, value: Mapping[str, Any]) -> None:
+        """Merge final polling facts without overwriting other checkpoint owners."""
+        if self._skill_states is None:
+            raise ValueError("final evaluation requires durable Skill state")
+        while True:
+            state = await self._skill_states.get(run_id)
+            if state is None:
+                raise ValueError("Skill input snapshot not found")
+            checkpoint = dict(state.checkpoint)
+            checkpoint["final_evaluation"] = dict(value)
+            try:
+                await self._skill_states.save_checkpoint(
+                    run_id,
+                    checkpoint,
+                    expected_revision=state.revision,
+                )
+                return
+            except SkillCheckpointConflict:
+                continue
+
+    async def _evaluate_final(
+        self,
+        run: EvolutionRunRecord,
+        rounds: Sequence[EvolutionRoundRecord],
+    ) -> EvalResult | None:
+        """Submit or poll independent baseline/best evaluation without waiting in a worker."""
+        if self._skill_states is None or self._gateway_for_run is None:
+            raise ValueError("final evaluation dependencies are missing")
+        state = await self._skill_states.get(run.id)
+        if state is None:
+            raise ValueError("Skill input snapshot not found")
+        pending = dict(state.checkpoint.get("final_evaluation", {}))
+        if pending.get("result") is not None:
+            return EvalResult.from_payload(pending["result"])
+        if not self._workspaces.push_enabled:
+            raise ValueError("real final evaluation requires published snapshot branches")
+        current = self._now()
+        gateway = self._gateway_for_run(run)
+        if not pending.get("external_id"):
+            accepted = [round_ for round_ in rounds if round_.accepted]
+            best_commit = accepted[-1].commit_hash if accepted else run.base_commit
+            if not best_commit or not run.base_commit or not run.workspace_path:
+                raise ValueError("final evaluation requires immutable commits and workspace")
+            best_ref = f"evo-snapshot/{run.id}/final-best"
+            await self._workspaces.publish_skill_snapshot(
+                Path(run.workspace_path),
+                branch=best_ref,
+                commit=best_commit,
+            )
+            submission = await gateway.submit(
+                EvalRequest(
+                    run_id=run.id,
+                    evolution_round_id="final",
+                    repo_url=run.repo_url,
+                    ref=best_ref,
+                    commit=best_commit,
+                    target_type=run.target_type,
+                    target_name=run.target_name,
+                    target_version=run.target_version,
+                    cluster_id="final",
+                    idempotency_key=f"{run.id}:final:{best_commit}:{pending.get('attempt', 0)}",
+                    baseline_ref=f"evo-snapshot/{run.id}/baseline",
+                    baseline_commit=run.base_commit,
+                )
+            )
+            if not submission.eval_id.strip():
+                raise ValueError("final evaluation returned blank id")
+            pending = {
+                **pending,
+                "external_id": submission.eval_id,
+                "started_at": current.isoformat(),
+                "next_poll_at": (current + self._poll_interval).isoformat(),
+            }
+            await self._save_final_state(run.id, pending)
+            return None
+        if current - datetime.fromisoformat(pending["started_at"]) >= self._timeout:
+            raise FinalEvaluationTerminalError("final evaluation timed out")
+        if current < datetime.fromisoformat(pending["next_poll_at"]):
+            return None
+        status = await gateway.get_status(pending["external_id"])
+        if status.status in {"queued", "running"}:
+            pending["next_poll_at"] = (current + self._poll_interval).isoformat()
+            await self._save_final_state(run.id, pending)
+            return None
+        if status.status != "completed":
+            raise FinalEvaluationTerminalError(
+                status.message or f"final evaluation {status.status}"
+            )
+        try:
+            result = await gateway.get_result(pending["external_id"])
+        except (ValueError, InvalidEvaluationEvidence) as exc:
+            raise FinalEvaluationTerminalError(str(exc)) from exc
+        pending["result"] = result.to_payload()
+        await self._save_final_state(run.id, pending)
+        return result
+
     async def _record(
         self,
         run_id: str,
@@ -315,9 +501,9 @@ def _job_retry_attempts(job: JobRunRecord) -> int:
 
 
 def decision_sentence(result: EvalResult, *, accepted: bool) -> str:
-    """Translate the placeholder score comparison into one human-readable rule."""
+    """Translate the strict score comparison into one human-readable rule."""
     delta = result.candidate_score - result.current_score
-    if math.isclose(delta, 0.0):
+    if delta == 0.0:
         relation = "等于"
     elif delta > 0:
         relation = "高于"
@@ -327,15 +513,18 @@ def decision_sentence(result: EvalResult, *, accepted: bool) -> str:
     return (
         f"候选分 {result.candidate_score:.1f} {relation}基线 "
         f"{result.current_score:.1f}（{delta:+.1f}），"
-        f"按 external-verdict 规则{verdict}"
+        f"按严格增分规则{verdict}"
     )
 
 
 def _final_values(
     run: EvolutionRunRecord,
     rounds: Sequence[EvolutionRoundRecord],
+    *,
+    result: EvalResult | None = None,
 ) -> Mapping[str, Any]:
     """Build deterministic final metrics from completed round evaluations."""
+    final_result = result
     evaluated = [
         (round_, EvalResult.from_payload(round_.eval_result))
         for round_ in rounds
@@ -357,6 +546,10 @@ def _final_values(
                 "finalCommit": round_.commit_hash,
             },
         )
+    if final_result is not None:
+        initial = final_result.current_score
+        best = final_result.candidate_score
+        metrics.append({"phase": "independent_final", **final_result.to_payload()})
     return {
         "run_id": run.id,
         "best_version": run.target_version,

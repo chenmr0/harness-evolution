@@ -64,6 +64,6 @@ async def test_upgrade_creates_catalog_sync_table(tmp_path: Path) -> None:
         assert exists is True
         assert columns == EXPECTED_COLUMNS
         assert primary_key == ["id"]
-        assert revision == "0012"
+        assert revision == "0013"
     finally:
         await database.dispose()

@@ -2498,7 +2498,7 @@ export interface components {
              * Status
              * @enum {string}
              */
-            status: "pending" | "evaluating" | "completed" | "failed" | "timeout";
+            status: "pending" | "evaluating" | "completed" | "failed" | "timeout" | "skipped";
         };
         /**
          * StepRoundPatch

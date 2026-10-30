@@ -297,3 +297,102 @@ async def test_unknown_step_path_is_a_plain_route_miss(
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+async def test_real_skill_steps_use_frozen_and_feedback_provenance(
+    steps_api: httpx.AsyncClient,
+) -> None:
+    """All six endpoints project snapshots even after upstream descriptions and links change."""
+    from sqlalchemy import delete
+
+    from app.db.crud.skill_evolution import SkillEvolutionRepository
+    from app.db.models.domain import probe_reports
+    from app.db.models.evolution import evolution_rounds, probe_cluster_probes
+
+    database = await _database(steps_api)
+    data = load_fixture("final")
+    await seed_fixture(database, data)
+    run_id = data["run"]["id"]
+    original = {
+        "probe_id": "pr-050b-03",
+        "attribute_type": "error",
+        "probe_description": "Frozen original issue",
+        "probe_analysis": "Frozen analysis",
+        "session_id": "original-session",
+        "from_bad_cases": [{"bad_case_id": "frozen-case"}],
+    }
+    feedback: dict[str, Any] = {
+        "probe_id": "feedback-probe-1",
+        "attribute_type": "error",
+        "probe_description": "Validation feedback issue",
+        "probe_analysis": "Validation evidence",
+        "session_id": None,
+        "from_bad_cases": [],
+    }
+    states = SkillEvolutionRepository(database)
+    state = await states.initialize(run_id, {"reports": [original], "files": {"SKILL.md": "old"}})
+    await states.save_checkpoint(
+        run_id,
+        {
+            "source_reports": [original, feedback],
+            "cluster_map": {
+                "C1": {"source_probe_ids": [original["probe_id"], feedback["probe_id"]]}
+            },
+        },
+        expected_revision=state.revision,
+    )
+    async with database.transaction() as session:
+        await session.execute(delete(probe_cluster_probes))
+        await session.execute(update(probe_reports).values(probe_description="MUTATED UPSTREAM"))
+        await session.execute(
+            update(evolution_rounds).values(
+                patch={
+                    "file": "SKILL.md",
+                    "changes": {"SKILL.md": "new"},
+                    "edit_patch": {"unified_diff": "--- a/SKILL.md\n+++ b/SKILL.md\n-old\n+new\n"},
+                }
+            )
+        )
+    payloads = {}
+    for key in STEP_KEYS:
+        response = await steps_api.get(_step_url(run_id, key))
+        assert response.status_code == 200, response.text
+        assert "MUTATED UPSTREAM" not in response.text
+        payloads[key] = response.json()["payload"]
+    assert len(payloads["input"]["rows"]) == 1
+    assert payloads["input"]["rows"][0]["description"] == "Frozen original issue"
+    assert payloads["input"]["hits"]["badCases"] == 1
+    cluster = payloads["clusters"]["clusters"][0]
+    assert cluster["probeCount"] == 2
+    assert cluster["probes"][1]["description"] == "Validation feedback issue"
+    assert cluster["probes"][1]["sourceBadCaseIds"] == []
+    assert len(payloads["attribution"]["items"]) == 2
+    assert payloads["severity"]["rows"][0]["reportCount"] == 1
+    assert payloads["iteration"]["rounds"][0]["probeCount"] == 2
+    assert "+new" in payloads["iteration"]["rounds"][0]["patch"]["lines"]
+    assert payloads["final"]["changes"][0]["reportCount"] == 1
+
+
+async def test_skipped_skill_evaluation_preserves_existing_step_dto(
+    steps_api: httpx.AsyncClient,
+) -> None:
+    """A safety-rejected patch never invents a completed evaluation or breaks its step."""
+    from app.db.models.evolution import evolution_rounds
+
+    database = await _database(steps_api)
+    data = load_fixture("iteration")
+    await seed_fixture(database, data)
+    async with database.transaction() as session:
+        await session.execute(
+            update(evolution_rounds).values(
+                status="rejected",
+                eval_status="skipped",
+                patch=None,
+                accepted=False,
+            )
+        )
+    response = await steps_api.get(_step_url(data["run"]["id"], "iteration"))
+    assert response.status_code == 200
+    round_ = response.json()["payload"]["rounds"][0]
+    assert round_["status"] == "rejected"
+    assert round_["eval"]["status"] == "skipped"

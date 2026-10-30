@@ -120,12 +120,17 @@ class EvolutionPrepareService:
         probes: RepositoryProbeReader,
         workspaces: WorkspacePreparer,
         events: PrepareEventRecorder | EvolutionRunEventService | None = None,
+        *,
+        skill_core: Any = None,
+        skill_states: Any = None,
     ) -> None:
         """Bind persistence, source probes, git workspaces, and events."""
         self._runs = runs
         self._probes = probes
         self._workspaces = workspaces
         self._events = events
+        self._skill_core = skill_core
+        self._skill_states = skill_states
 
     async def handle(self, job: JobRunRecord) -> Mapping[str, Any]:
         """Prepare one run idempotently and return its durable summary."""
@@ -133,6 +138,12 @@ class EvolutionPrepareService:
         run = await self._runs.get_run(run_id)
         if run is None:
             raise LookupError("evolution run not found")
+        if run.target_type == "skill" and run.mode == "full" and self._skill_core is None:
+            existing_state = (
+                await self._skill_states.get(run.id) if self._skill_states is not None else None
+            )
+            if run.eval_config.get("skillEvolution") == "real" or existing_state is not None:
+                raise ValueError("Real Skill model is unavailable; refusing placeholder fallback")
         if await self._already_prepared(run):
             return {
                 "runId": run.id,
@@ -140,6 +151,20 @@ class EvolutionPrepareService:
                 "progressUnit": run.progress_unit,
                 "reused": True,
             }
+
+        if (
+            run.target_type == "skill"
+            and run.mode == "full"
+            and self._skill_core is not None
+            and (
+                run.eval_config.get("skillEvolution") == "real"
+                or (
+                    self._skill_states is not None
+                    and await self._skill_states.get(run.id) is not None
+                )
+            )
+        ):
+            return await self._prepare_skill(run, job)
 
         query = _query_from_payload(job.payload, run)
         probes = await self._probes.list_matching(query)
@@ -330,6 +355,173 @@ class EvolutionPrepareService:
             "progressUnit": prepared.progress_unit,
             "clusters": len(clusters),
             "rounds": len(clusters) if run.mode == "full" else 0,
+        }
+
+    async def _prepare_skill(self, run: EvolutionRunRecord, job: JobRunRecord) -> Mapping[str, Any]:
+        """Freeze inputs once, then persist verified Skill clusters and eligible rounds."""
+        from dataclasses import asdict, replace
+        from pathlib import Path
+
+        from app.service.evolution.skill_safety import (
+            MAX_FILE_BYTES,
+            MAX_FILES,
+            MAX_TOTAL_BYTES,
+            reject_sensitive_payload,
+            validate_patch,
+        )
+
+        if self._skill_states is None or self._skill_core is None:
+            raise ValueError("Skill evolution dependencies are missing")
+        state = await self._skill_states.get(run.id)
+        frozen_run = (
+            replace(run, target_version=str(state.input_snapshot["base_commit"]))
+            if state is not None
+            else run
+        )
+        workspace = await self._workspaces.prepare(frozen_run)
+        if state is None:
+            probes = await self._probes.list_matching(_query_from_payload(job.payload, run))
+            if not probes:
+                raise ValueError("no analyzed Skill probes matched")
+            root = workspace.path / run.sub_dir
+            if root.is_symlink():
+                raise ValueError("Skill directory cannot be a symlink")
+            root.resolve().relative_to(workspace.path.resolve())
+            files: dict[str, str] = {}
+            total = 0
+            for path in sorted(root.rglob("*")):
+                relative = path.relative_to(root)
+                if ".git" in relative.parts:
+                    continue
+                if path.is_symlink():
+                    raise ValueError("Skill tree contains a symlink")
+                if not path.is_file():
+                    continue
+                size = path.stat().st_size
+                total += size
+                if size > MAX_FILE_BYTES or total > MAX_TOTAL_BYTES or len(files) >= MAX_FILES:
+                    raise ValueError("Skill tree exceeds text snapshot limits")
+                files[relative.as_posix()] = path.read_text(encoding="utf-8")
+            if "SKILL.md" not in files:
+                raise ValueError("Skill tree requires SKILL.md")
+            reports = [
+                dict(
+                    probe_id=p.probe_id,
+                    probe_type="skill",
+                    attribute_type=p.attribute_type,
+                    probe_description=p.description,
+                    probe_analysis=p.analysis,
+                    session_id=p.session_id,
+                    from_bad_cases=[{"bad_case_id": key} for key in p.bad_case_ids],
+                )
+                for p in probes
+            ]
+            validate_patch(files, {})
+            reject_sensitive_payload(reports)
+            state = await self._skill_states.initialize(
+                run.id,
+                {
+                    "reports": reports,
+                    "files": files,
+                    "base_commit": workspace.base_commit,
+                },
+            )
+        from app.service.evolution.skill_identity import skill_identity
+
+        checkpoint = dict(state.checkpoint)
+        identity = skill_identity(self._skill_core)
+        if checkpoint.get("identity", identity) != identity:
+            raise ValueError("Skill model or strategy changed since preparation")
+        checkpoint["identity"] = identity
+        if "plan" not in checkpoint:
+            plan = await self._skill_core.plan(
+                list(state.input_snapshot["reports"]),
+                dict(state.input_snapshot["files"]),
+            )
+            checkpoint.update(plan=asdict(plan), best_files=dict(state.input_snapshot["files"]))
+            state = await self._skill_states.save_checkpoint(
+                run.id,
+                checkpoint,
+                expected_revision=state.revision,
+            )
+        plan_data = checkpoint["plan"]
+        planned = plan_data["clusters"]
+        current = await self._runs.get_run(run.id)
+        if current is None:
+            raise LookupError("evolution run disappeared")
+        if current.progress_unit == 0:
+            await self._runs.advance_unit(run.id, expected=0, target=1, cluster_count=len(planned))
+        if current.progress_unit <= 1:
+            clusters = await self._runs.replace_clusters(
+                run.id,
+                tuple(
+                    ClusterWrite(
+                        type=item["attribute_type"],
+                        description=item["probe_cluster_description"],
+                        probes=tuple(item["source_probe_ids"]),
+                        impact=1.0,
+                    )
+                    for item in planned
+                ),
+            )
+            await self._runs.advance_unit(run.id, expected=1, target=2, cluster_count=len(planned))
+        else:
+            clusters = await self._runs.list_clusters(run.id)
+        mapping = {
+            cluster.probe_cluster_id: item for cluster, item in zip(clusters, planned, strict=True)
+        }
+        if current.progress_unit <= 2:
+            await self._runs.write_cluster_confidence(
+                run.id, {key: item["critic"]["confidence"] for key, item in mapping.items()}
+            )
+        if current.progress_unit <= 3:
+            await self._runs.write_cluster_severity(
+                run.id, {key: (item["priority"], item["rank"]) for key, item in mapping.items()}
+            )
+        if not await self._runs.list_rounds(run.id):
+            await self._runs.insert_rounds(
+                tuple(
+                    {
+                        "id": new_id(),
+                        "run_id": run.id,
+                        "probe_cluster_id": key,
+                        "seq": seq,
+                        "status": "pending" if item["disposition"] == "selected" else "skipped",
+                        "eval_status": "pending"
+                        if item["disposition"] == "selected"
+                        else "skipped",
+                    }
+                    for seq, (key, item) in enumerate(mapping.items(), 1)
+                )
+            )
+        baseline_ref = f"evo-snapshot/{run.id}/baseline"
+        await cast(Any, self._workspaces).publish_skill_snapshot(
+            Path(workspace.path),
+            branch=baseline_ref,
+            commit=workspace.base_commit,
+        )
+        checkpoint.update(cluster_map=mapping, baseline_ref=baseline_ref)
+        await self._skill_states.save_checkpoint(
+            run.id, checkpoint, expected_revision=state.revision
+        )
+        prepared = await self._runs.mark_prepared(
+            run.id,
+            status="running",
+            progress_unit=4,
+            repo_path=str(workspace.repo_path),
+            base_ref=workspace.ref,
+            base_commit=workspace.base_commit,
+            branch_name=workspace.branch,
+            workspace_path=str(workspace.path),
+            stats={"clusters": len(clusters)},
+            skipped_rounds=sum(item["disposition"] != "selected" for item in planned),
+        )
+        return {
+            "runId": run.id,
+            "status": prepared.status,
+            "progressUnit": prepared.progress_unit,
+            "clusters": len(clusters),
+            "rounds": len(clusters),
         }
 
     async def _already_prepared(self, run: EvolutionRunRecord) -> bool:

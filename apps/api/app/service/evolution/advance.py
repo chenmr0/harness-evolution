@@ -76,12 +76,15 @@ class EvolutionAdvanceService:
         candidates: EvolutionCandidateService,
         probes: ProbeSourceReader,
         eval_submitter: EvalSubmitter | None = None,
+        *,
+        skill_states: Any = None,
     ) -> None:
         """Bind durable rounds, candidate publication, and source evidence."""
         self._runs = runs
         self._candidates = candidates
         self._probes = probes
         self._eval_submitter = eval_submitter
+        self._skill_states = skill_states
 
     async def handle(self, job: JobRunRecord) -> Mapping[str, Any]:
         """Publish exactly one pending round and leave evaluation to m5-10."""
@@ -99,7 +102,7 @@ class EvolutionAdvanceService:
         rounds = await self._runs.list_rounds(run.id)
         target = None
         for round_ in rounds:
-            if round_.status in {"accepted", "rejected"}:
+            if round_.status in {"accepted", "rejected", "skipped"}:
                 continue
             if round_.status != "pending":
                 return {
@@ -145,16 +148,26 @@ class EvolutionAdvanceService:
             for link in await self._runs.list_cluster_probes(run.id)
             if link.probe_cluster_id == cluster.probe_cluster_id
         )
-        rows = await self._probes.list_rows_by_ids(links)
-        current = await self._candidates.publish(
-            run,
-            target,
-            build_candidate_trace(
+        state = await self._skill_states.get(run.id) if self._skill_states is not None else None
+        if state is not None:
+            trace = build_frozen_candidate_trace(
+                state,
+                cluster.probe_cluster_id,
+                cluster.probe_cluster_description,
+                links,
+            )
+        else:
+            rows = await self._probes.list_rows_by_ids(links)
+            trace = build_candidate_trace(
                 cluster.probe_cluster_id,
                 cluster.probe_cluster_description,
                 links,
                 rows,
-            ),
+            )
+        current = await self._candidates.publish(
+            run,
+            target,
+            trace,
             job_id=job.id,
         )
         if (
@@ -272,6 +285,40 @@ def build_candidate_trace(
         )
         or title,
         sources=sources,
+    )
+
+
+def build_frozen_candidate_trace(
+    state: Any,
+    cluster_id: str,
+    title: str,
+    links: tuple[str, ...] = (),
+) -> CandidateTrace:
+    """Render original or feedback provenance without re-reading mutable upstream rows."""
+    if not links:
+        links = tuple(state.checkpoint["cluster_map"][cluster_id]["source_probe_ids"])
+    frozen_reports = state.checkpoint.get("source_reports", state.input_snapshot["reports"])
+    reports = [report for report in frozen_reports if report["probe_id"] in links]
+    return CandidateTrace(
+        cluster_id=cluster_id,
+        cluster_title=title,
+        probes=links,
+        bad_cases=tuple(
+            dict.fromkeys(
+                case["bad_case_id"] for report in reports for case in report["from_bad_cases"]
+            )
+        ),
+        analysis="\n".join(report["probe_analysis"] for report in reports),
+        sources=tuple(
+            CandidateSource(
+                probe_id=report["probe_id"],
+                bad_case_ids=tuple(case["bad_case_id"] for case in report["from_bad_cases"]),
+                session_id=report.get("session_id"),
+                description=report["probe_description"],
+                analysis=report["probe_analysis"],
+            )
+            for report in reports
+        ),
     )
 
 

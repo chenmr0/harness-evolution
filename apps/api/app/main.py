@@ -1,6 +1,7 @@
 """FastAPI application composition root."""
 
 import logging
+import os
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -34,6 +35,7 @@ from app.db.crud.probe_query import ProbeQueryRepository
 from app.db.crud.problems import ProblemRepository
 from app.db.crud.run_events import SqlRunEventStore
 from app.db.crud.sessions import SessionRepository
+from app.db.crud.skill_evolution import SkillEvolutionRepository
 from app.db.factory import create_database
 from app.db.migrate import upgrade_database
 from app.db.models.jobs import JobRunRecord
@@ -66,8 +68,9 @@ from app.service.evolution.apply_final import (
     EvolutionFinalizeService,
 )
 from app.service.evolution.blocked_sweeper import EvolutionBlockedSweeper
-from app.service.evolution.engine.contracts import EngineDeps
+from app.service.evolution.engine.contracts import EngineDeps, EvalGatewayConfig
 from app.service.evolution.engine.factory import EngineFactory
+from app.service.evolution.engine.http_eval import HttpEvalGateway
 from app.service.evolution.eval_poller import (
     EvolutionEvalPoller,
     EvolutionEvalSubmitter,
@@ -86,6 +89,9 @@ from app.service.evolution.prepare import (
 from app.service.evolution.probe_query import ProbeQueryService
 from app.service.evolution.retry import EvolutionRetryService
 from app.service.evolution.runs import EvolutionRunService
+from app.service.evolution.skill_contracts import strategy_from_environment
+from app.service.evolution.skill_core import SkillEvolutionCore
+from app.service.evolution.skill_feedback import SkillFeedbackService
 from app.service.evolution.stages import EvolutionStageService
 from app.service.evolution.targets import EvolutionTargetService
 from app.service.identity.service import IdentityService
@@ -98,6 +104,7 @@ from app.third_party_api.git.remote import GitRemote, SubprocessGitRemote
 from app.third_party_api.git.workspace import GitWorkspaceManager
 from app.third_party_api.session_query.http import HttpSessionQuerySource
 from app.third_party_api.session_query.models import SessionQuerySource
+from app.third_party_api.skill_model import model_from_environment
 from app.third_party_api.trajectory.http import HttpTrajectorySource
 from app.third_party_api.trajectory.source import TrajectorySource
 
@@ -229,13 +236,21 @@ def create_app(
     evolution_targets = EvolutionTargetService(target_repository, resolved_git_remote)
     probe_query_repository = ProbeQueryRepository(resolved_database)
     evolution_runs = EvolutionRunService(evolution_repository, run_event_store)
-    evolution_stages = EvolutionStageService(evolution_repository, probe_query_repository)
+    skill_states = SkillEvolutionRepository(resolved_database)
+    evolution_stages = EvolutionStageService(
+        evolution_repository, probe_query_repository, skill_states=skill_states
+    )
+    model_enabled = os.environ.get("SKILL_EVOLUTION_MODEL_ENABLED") == "1"
+    eval_enabled = os.environ.get("SKILL_EVOLUTION_EVAL_ENABLED") == "1"
+    if model_enabled != eval_enabled:
+        raise ValueError("Skill model and evaluation must both be enabled")
     evolution_launch = EvolutionLaunchService(
         target_repository,
         probe_query_repository,
         evolution_repository,
         jobs,
         evolution_events,
+        real_skill_enabled=model_enabled,
     )
     probe_query = ProbeQueryService(probe_query_repository, target_repository)
     default_workspace_manager = GitWorkspaceManager(
@@ -246,21 +261,47 @@ def create_app(
     workspace_manager = git_workspaces or default_workspace_manager
     candidate_workspace_manager = cast(GitWorkspaceManager, workspace_manager)
     lifecycle_workspace_manager = cast(Any, workspace_manager)
+    skill_core = (
+        SkillEvolutionCore(model_from_environment(), strategy_from_environment())
+        if model_enabled
+        else None
+    )
+    eval_server_config = {
+        "enabled": eval_enabled,
+        "baseUrl": os.environ.get("SKILL_EVOLUTION_EVAL_URL", ""),
+        "tokenEnv": os.environ.get("SKILL_EVOLUTION_EVAL_TOKEN_ENV", "EVALUATION_TOKEN"),
+        "allowHttp": os.environ.get("SKILL_EVOLUTION_EVAL_ALLOW_HTTP") == "1",
+        "timeoutSeconds": float(os.environ.get("SKILL_EVOLUTION_EVAL_TIMEOUT", "30")),
+        "templateId": os.environ.get("SKILL_EVOLUTION_EVAL_TEMPLATE_ID", ""),
+    }
     prepare_service = EvolutionPrepareService(
         evolution_repository,
         RepositoryProbeReader(probe_query_repository),
         workspace_manager,
         evolution_events,
+        skill_core=skill_core,
+        skill_states=skill_states,
     )
     evolution_candidates = EvolutionCandidateService(
         evolution_repository,
         candidate_workspace_manager,
         events=evolution_events,
         web_base_url=resolved_settings.web_base_url,
+        skill_core=skill_core,
+        skill_states=skill_states,
     )
 
     def gateway_for_run(run: Any) -> Any:
         """Resolve a gateway through the run's registered engine and frozen config."""
+        if run.eval_config.get("skillEvolution") == "real":
+            if not model_enabled:
+                raise ValueError("Real Skill evaluation is disabled; cannot resume this run")
+            return HttpEvalGateway(
+                EvalGatewayConfig.from_mapping(run.eval_config),
+                run_id=run.id,
+                states=skill_states,
+                server_config=eval_server_config,
+            )
         engine = EngineFactory.for_run(
             run,
             EngineDeps(
@@ -282,16 +323,23 @@ def create_app(
         evolution_candidates,
         probe_query_repository,
         evolution_eval_submitter,
+        skill_states=skill_states,
     )
     evolution_apply = EvolutionApplyService(
         evolution_repository,
         evolution_candidates,
         probe_query_repository,
+        skill_states=skill_states,
     )
     evolution_finalize = EvolutionFinalizeService(
         evolution_repository,
         candidate_workspace_manager,
         events=evolution_events,
+        gateway_for_run=gateway_for_run if model_enabled else None,
+        skill_states=skill_states if model_enabled else None,
+        feedback=SkillFeedbackService(skill_core, skill_states) if skill_core else None,
+        poll_interval=timedelta(seconds=resolved_settings.eval_poll_seconds),
+        timeout=timedelta(seconds=resolved_settings.eval_timeout_seconds),
     )
     evolution_eval_poller = EvolutionEvalPoller(
         evolution_repository,
@@ -324,6 +372,7 @@ def create_app(
         eval_submitter=evolution_eval_submitter,
         probes=probe_query_repository,
         events=evolution_events,
+        skill_states=skill_states,
     )
     evolution_blocked_sweeper = EvolutionBlockedSweeper(
         evolution_repository,
