@@ -294,4 +294,67 @@ describe("evolution step content", () => {
     expect(wrapper.text()).toContain("cd34ab12ef56");
     expect(wrapper.text()).toContain("错误");
   });
+
+  it("renders independent final mean and paired cases without mixing iteration scores", () => {
+    const wrapper = mount(StepFinal, {
+      props: {
+        targetVersion: "v2.0.0",
+        step: {
+          ...finalStep,
+          payload: {
+            ...finalStep.payload,
+            metrics: [
+              { round: 1, currentScore: 90, candidateScore: 99, delta: 9 },
+              {
+                phase: "independent_final", currentScore: 5, candidateScore: 7,
+                metrics: [{
+                  kind: "case_scores",
+                  current: { score: 5, caseScores: { case1: 3, case2: 7 } },
+                  candidate: { score: 7, caseScores: { case2: 7, case1: 7 } },
+                }],
+              },
+            ],
+            changes: [{ ...finalStep.payload.changes[0]!, reportCount: 2 }],
+          },
+        },
+      },
+    });
+    expect(wrapper.findAll("tbody tr").map((row) => row.findAll("td").map((cell) => cell.text())))
+      .toEqual([
+        ["total_score 均值", "5", "7", "+2.0"],
+        ["用例 case1", "3", "7", "+4.0"],
+        ["用例 case2", "7", "7", "+0.0"],
+      ]);
+    expect(wrapper.text()).not.toContain("终评指标暂不可用");
+    expect(wrapper.text()).toContain("来源 2 个问题");
+    expect(wrapper.text()).not.toContain("来源 2 份报告");
+  });
+
+  it.each([
+    { case2: 7 },
+    { case1: "7" },
+    { case1: Number.NaN },
+    {},
+  ])("does not fabricate comparisons for invalid or mismatched case evidence %j", (caseScores) => {
+    const wrapper = mount(StepFinal, {
+      props: {
+        targetVersion: "v2.0.0",
+        step: {
+          ...finalStep,
+          payload: {
+            ...finalStep.payload,
+            metrics: [{
+              phase: "independent_final", currentScore: 5, candidateScore: 7,
+              metrics: [{
+                kind: "case_scores",
+                current: { caseScores: { case1: 5 } }, candidate: { caseScores },
+              }],
+            }],
+          },
+        },
+      },
+    });
+    expect(wrapper.find("table.metrics").exists()).toBe(false);
+    expect(wrapper.text()).toContain("终评指标暂不可用");
+  });
 });

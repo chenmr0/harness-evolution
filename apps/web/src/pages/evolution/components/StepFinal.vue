@@ -17,8 +17,49 @@ type Metric = {
   unit: string;
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isScore(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function independentMetrics(item: Record<string, unknown>): Metric[] {
+  if (!Array.isArray(item.metrics) || !isScore(item.currentScore) || !isScore(item.candidateScore)) {
+    return [];
+  }
+  const evidence: unknown = item.metrics.find((entry: unknown) =>
+    isRecord(entry) && entry.kind === "case_scores",
+  );
+  if (!isRecord(evidence) || !isRecord(evidence.current) || !isRecord(evidence.candidate)) {
+    return [];
+  }
+  const baseline = evidence.current.caseScores;
+  const candidate = evidence.candidate.caseScores;
+  if (!isRecord(baseline) || !isRecord(candidate)) return [];
+  const caseIds = Object.keys(baseline).sort();
+  if (!caseIds.length || caseIds.length !== Object.keys(candidate).length) return [];
+  const rows: Metric[] = [];
+  for (const caseId of caseIds) {
+    const init = baseline[caseId];
+    const best = candidate[caseId];
+    if (!Object.hasOwn(candidate, caseId) || !isScore(init) || !isScore(best) || !isScore(best - init)) {
+      return [];
+    }
+    rows.push({ name: `用例 ${caseId}`, init, best, delta: best - init, unit: "" });
+  }
+  const delta = item.candidateScore - item.currentScore;
+  if (!isScore(delta)) return [];
+  return [
+    { name: "total_score 均值", init: item.currentScore, best: item.candidateScore, delta, unit: "" },
+    ...rows,
+  ];
+}
+
 const metrics = computed(() =>
   props.step.payload.metrics.flatMap((item): Metric[] => {
+    if (item.phase === "independent_final") return independentMetrics(item);
     const name = item.name;
     const init = item.init;
     const best = item.best;
@@ -27,7 +68,7 @@ const metrics = computed(() =>
       typeof name !== "string" ||
       (typeof init !== "number" && typeof init !== "string") ||
       (typeof best !== "number" && typeof best !== "string") ||
-      typeof delta !== "number"
+      !isScore(delta)
     ) {
       return [];
     }
@@ -117,7 +158,7 @@ const pushedAtLabel = computed(() =>
               class="type-chip"
               :class="`type-${change.type}`"
             >{{ typeLabel(change.type) }}</span>
-            <span class="muted">来源 {{ change.reportCount }} 份报告</span>
+            <span class="muted">来源 {{ change.reportCount }} 个问题</span>
           </div>
         </div>
         <p

@@ -67,6 +67,7 @@ Use synthetic many-to-one report relationships and isolated Git. Completion must
 
 - All six API steps are readable and the final UI is clickable; repeated completion does not advance again.
 - Show report and source-problem counts separately; preserve all original reports in input statistics.
+- Display independent final means and per-case comparisons with legacy compatibility; label change-source counts as problems.
 - Real CodeAgent generates reviewable plans and patches; mock scores do not prove real quality gains.
 
 ## Gates and CI

@@ -20,6 +20,8 @@ CodeAgent and HTTP models share stage prompts and output validation. The CLI rec
 
 The CLI uses stage JSON Schemas for clustering, verification, patches, and feedback. Reject Markdown replacements consisting only of headings and omission markers so placeholders cannot erase rules. This bounded completeness check does not replace real evaluation or content review.
 
+The final table projects means and case-ID-paired scores from independent final evaluations while retaining flat-metric compatibility. Iteration evaluations cannot substitute for final evidence, and missing or mismatched cases are not filled with zero. Change-source counts retain the backend's distinct Bad Case semantics and use a problem-count label rather than an attribution-report count.
+
 ## Alternatives considered
 
 - Deploy a second evolution service: this would duplicate task state and UI APIs, so the existing orchestration hosts the integrated capabilities.
