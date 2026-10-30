@@ -105,6 +105,26 @@ function useCatalogHandlers(): void {
 }
 
 describe("launch wizard", { timeout: 30000 }, () => {
+  it("distinguishes reports from their many source bad cases", async () => {
+    useCatalogHandlers();
+    server.use(http.post("/api/evolution/probes/query", () => HttpResponse.json({
+      ...preview,
+      summary: { ...preview.summary, probes: 5, badCases: 7, analyzed: 7, unanalyzed: 0 },
+    })));
+    const wrapper = await mountWizard();
+    await wrapper.get("[data-testid='wizard-target']").setValue("tgt-1");
+    await flushPromises();
+    await wrapper.get("[data-testid='wizard-from']").setValue("2026-10-24");
+    await wrapper.get("[data-testid='wizard-to']").setValue("2026-10-25");
+    await wrapper.get("[data-testid='wizard-next']").trigger("click");
+    await flushPromises();
+    const counters = wrapper.findAll(".wz-stats .st").map((item) => item.text());
+    expect(counters).toContain("5问题报告");
+    expect(counters).toContain("7来源问题");
+    expect(counters).toContain("7已分析来源问题");
+    expect(counters).not.toContain("7问题报告");
+  });
+
   it("keeps unconfigured objects out of the candidate selector", async () => {
     useCatalogHandlers();
     const wrapper = await mountWizard();

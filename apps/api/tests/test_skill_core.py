@@ -7,8 +7,17 @@ import pytest
 
 from app.service.evolution.skill_contracts import SkillStrategy
 from app.service.evolution.skill_core import SkillEvolutionCore, deduplicate, edit_patch
+from app.service.evolution.skill_safety import validate_patch
 
 FILES = {"SKILL.md": "---\nname: demo\n---\n# Demo\n"}
+
+
+def test_placeholder_replacement_cannot_erase_review_rules() -> None:
+    files = {**FILES, "references/rules.md": "# Rules\nPreserve evidenced defects.\n"}
+    with pytest.raises(ValueError, match="omission placeholder"):
+        validate_patch(files, {"references/rules.md": "# Rules...\n..."})
+    assert validate_patch(files, {"references/rules.md": "# Rules\nExample: ... means omitted.\n"})
+    assert validate_patch(files, {"scripts/protocol.py": "def interface(): ...\n"})
 
 
 def reports() -> list[dict[str, Any]]:

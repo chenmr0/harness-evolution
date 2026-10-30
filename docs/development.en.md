@@ -15,33 +15,15 @@ English | [中文](development.md)
 
 ## Development flow
 
-Once the flow tree is initialized, every change starts with an issue: `.agents/flow/` holds the roadmap → milestone → issue working files, with the contract and priority rules in [.agents/flow/README.md](../.agents/flow/README.en.md). Create a trio with `pnpm flow:new-issue -- …`; commits and PR titles carry `(#N)`; `pnpm flow:sync` writes the flow tree to GitHub and backfills numbers.
+Code changes require an issue; commit and PR titles include `(#N)`. Creation, synchronization, and state rules live in the [flow contract](../.agents/flow/README.en.md).
+
+## CodeAgent integration
+
+Select `SKILL_EVOLUTION_MODEL_BACKEND=codeagent` and `SKILL_EVOLUTION_CODEAGENT_ENABLED=1`, with model and evaluation enabled. `SKILL_EVOLUTION_CODEAGENT_CMD` selects a native executable; `SKILL_EVOLUTION_CODEAGENT_ENV_NAMES` lists model environment names to inherit. Inject credentials locally. See the [CLI adapter](../apps/api/app/third_party_api/codeagent.py) for other settings.
 
 ## Daily loop
 
-```sh
-pnpm dev
-pnpm typecheck
-pnpm typecheck:web
-pnpm test:web
-pnpm test:api
-pnpm test:db
-pnpm test:db:mysql
-pnpm test:integration
-pnpm test:e2e
-pnpm performance:report [--local]
-pnpm fixtures:check
-pnpm fixtures:seed
-pnpm data:import:sessions
-pnpm data:normalize:sessions
-pnpm data:tree:sessions
-pnpm data:replay:sessions
-pnpm verify:local-sessions
-pnpm verify:local-data
-pnpm test:all
-pnpm contract:generate
-pnpm contract:check
-```
+The command list lives in [package.json](../package.json). Start locally with `pnpm dev` and select validation from the table below.
 
 Choose gates by change surface before committing:
 

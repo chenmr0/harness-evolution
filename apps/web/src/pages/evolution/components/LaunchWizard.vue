@@ -392,9 +392,10 @@ const versionPlaceholder = computed(() =>
           >
             <div class="wz-stats">
               <span class="st"><b>{{ preview.summary.sessions }}</b><span>命中 session</span></span>
-              <span class="st"><b>{{ preview.summary.badCases }}</b><span>问题报告</span></span>
-              <span class="st"><b>{{ preview.summary.analyzed }}</b><span>已分析</span></span>
-              <span class="st"><b>{{ preview.summary.unanalyzed }}</b><span>未分析</span></span>
+              <span class="st"><b>{{ preview.summary.probes }}</b><span>问题报告</span></span>
+              <span class="st"><b>{{ preview.summary.badCases }}</b><span>来源问题</span></span>
+              <span class="st"><b>{{ preview.summary.analyzed }}</b><span>已分析来源问题</span></span>
+              <span class="st"><b>{{ preview.summary.unanalyzed }}</b><span>未分析来源问题</span></span>
               <span class="st accent"><b>{{ preview.summary.usedProbes }}</b><span>「是问题」进入聚类</span></span>
             </div>
             <div

@@ -41,6 +41,8 @@ from app.service.evolution.probe_query import ProbeQueryRequest
 from app.service.evolution.skill_contracts import SkillStrategy
 from app.service.evolution.skill_core import SkillEvolutionCore
 from app.service.evolution.skill_feedback import SkillFeedbackService
+from app.service.evolution.stages import EvolutionStageService
+from app.service.evolution.state import total_units
 from app.third_party_api.evaluation.models import CaseScore
 from app.third_party_api.git.workspace import (
     GitWorkspaceManager,
@@ -445,6 +447,17 @@ async def test_full_skill_launch_feedback_restart_and_final(
             clock += timedelta(seconds=2)
     current = await runs.get_run(run_id)
     assert current is not None and current.status == "completed"
+    clusters = await runs.list_clusters(run_id)
+    assert current.progress_unit == total_units(len(clusters))
+    assert current.stats["sessions"] == 3
+    assert current.stats["probes"] == 3
+    assert current.stats["byAttributeType"] == {"model": 1, "prompt": 1, "error": 1, "nonIssue": 0}
+    # Completion and retries must keep the public final step readable.
+    await runs.complete_run(run_id, finished_at=now())
+    replayed = await runs.get_run(run_id)
+    assert replayed is not None and replayed.progress_unit == current.progress_unit
+    stage = await EvolutionStageService(runs, probes, skill_states=states).step(run_id, "final")
+    assert stage is not None and stage.status == "done"
     rounds = await runs.list_rounds(run_id)
     assert [r.status for r in rounds] == ["accepted", "rejected", "skipped", "accepted"]
     state = await states.get(run_id)

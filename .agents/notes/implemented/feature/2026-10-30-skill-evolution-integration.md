@@ -16,6 +16,10 @@ Status: implemented
 
 服务端同时设置 `SKILL_EVOLUTION_MODEL_ENABLED=1` 和 `SKILL_EVOLUTION_EVAL_ENABLED=1` 才启用真实 Skill 流程；分别配置 `SKILL_EVOLUTION_MODEL_URL`、`SKILL_EVOLUTION_MODEL`、`SKILL_EVOLUTION_MODEL_KEY_ENV`、`SKILL_EVOLUTION_EVAL_URL`、`SKILL_EVOLUTION_EVAL_TOKEN_ENV` 与 `SKILL_EVOLUTION_EVAL_TEMPLATE_ID`。密钥内容放在对应环境变量中，不写入请求或仓库。`HE_SKILL_STRATEGY_JSON` 可配置进化策略；默认使用内置策略。真实评测要求可推送到目标 Git 仓库。新建任务冻结真实模式，恢复时不可降级到模拟流程。
 
+CodeAgent 与 HTTP 模型共享阶段提示和输出校验。CLI 通过标准输入接收报告快照，关闭工具、MCP、设置继承和会话持久化；日志只保留脱敏调用元数据，输入与结构化产物存隔离目录；超时或取消时清理整个进程组。冻结模型二进制与端点身份防止恢复时切换实现。完成事务同步终态游标，输入计数来自冻结报告而非当前上游，报告与来源问题分别展示。
+
+CLI 使用阶段 JSON Schema 描述聚类、核查、补丁和反馈输出；Markdown 替换若只有标题和省略符则拒绝，避免占位文本抹掉规则。这是有界完整性检查，不代替真实评测或内容检视。
+
 ## Alternatives considered
 
 - 单独部署第二套进化服务：会重复维护任务状态与页面接口，故沿用现有编排并迁入能力。

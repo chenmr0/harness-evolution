@@ -513,7 +513,22 @@ class EvolutionPrepareService:
             base_commit=workspace.base_commit,
             branch_name=workspace.branch,
             workspace_path=str(workspace.path),
-            stats={"clusters": len(clusters)},
+            stats=_stats(
+                tuple(
+                    PrepareProbe(
+                        probe_id=report["probe_id"],
+                        attribute_type=report["attribute_type"],
+                        session_id=report["session_id"],
+                        bad_case_ids=tuple(
+                            case["bad_case_id"] for case in report["from_bad_cases"]
+                        ),
+                        description=report["probe_description"],
+                        analysis=report["probe_analysis"],
+                    )
+                    for report in state.input_snapshot["reports"]
+                ),
+                clusters,
+            ),
             skipped_rounds=sum(item["disposition"] != "selected" for item in planned),
         )
         return {

@@ -15,33 +15,15 @@
 
 ## 开发流程
 
-流程树初始化后，改动先立 issue：`.agents/flow/` 里 roadmap → milestone → issue 工作文件，契约与优先级推进规则见 [.agents/flow/README.md](../.agents/flow/README.md)。新 issue 用 `pnpm flow:new-issue -- …` 生成三件套；提交与 PR 标题含 `(#N)`；`pnpm flow:sync` 把流程树同步到 GitHub 并回填编号。
+代码改动先挂 issue，提交与 PR 标题含 `(#N)`；创建、同步和状态规则见 [流程契约](../.agents/flow/README.md)。
+
+## CodeAgent 联调
+
+选择 `SKILL_EVOLUTION_MODEL_BACKEND=codeagent`、`SKILL_EVOLUTION_CODEAGENT_ENABLED=1`，同时启用模型和评测。`SKILL_EVOLUTION_CODEAGENT_CMD` 指向原生程序；`SKILL_EVOLUTION_CODEAGENT_ENV_NAMES` 列出继承的模型环境变量名，凭据仅在本机注入。其余配置见 [CLI 适配器](../apps/api/app/third_party_api/codeagent.py)。
 
 ## 日常循环
 
-```sh
-pnpm dev
-pnpm typecheck
-pnpm typecheck:web
-pnpm test:web
-pnpm test:api
-pnpm test:db
-pnpm test:db:mysql
-pnpm test:integration
-pnpm test:e2e
-pnpm performance:report [--local]
-pnpm fixtures:check
-pnpm fixtures:seed
-pnpm data:import:sessions
-pnpm data:normalize:sessions
-pnpm data:tree:sessions
-pnpm data:replay:sessions
-pnpm verify:local-sessions
-pnpm verify:local-data
-pnpm test:all
-pnpm contract:generate
-pnpm contract:check
-```
+命令清单以 [package.json](../package.json) 为准；本地启动使用 `pnpm dev`，按下表运行对应验证。
 
 提交前按改动面选择门禁：
 

@@ -127,6 +127,14 @@ def validate_patch(files: dict[str, str], changes: dict[str, str | None]) -> dic
             continue
         if not isinstance(content, str):
             raise ValueError("Patch contents must be text or None")
+        if path.lower().endswith(".md") and content != files.get(path):
+            body = [
+                line.strip()
+                for line in content.splitlines()
+                if line.strip() and not line.lstrip().startswith("#")
+            ]
+            if body and all(line in {"...", "…", "……"} for line in body):
+                raise ValueError("Markdown replacement is only an omission placeholder")
         if path == "SKILL.md" and _frontmatter(content) != _frontmatter(files[path]):
             raise ValueError("SKILL.md frontmatter is immutable")
         reject_secrets(content)

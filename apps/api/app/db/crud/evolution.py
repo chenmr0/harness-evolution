@@ -31,7 +31,7 @@ from app.db.models.evolution import (
 )
 from app.db.models.skill_evolution import skill_evolution_state
 from app.db.models.users import users
-from app.service.evolution.state import StageConflict, validate_transition
+from app.service.evolution.state import StageConflict, total_units, validate_transition
 from app.utils.ids import new_id
 from app.utils.time import now_shanghai
 
@@ -1609,6 +1609,21 @@ class EvolutionRepository:
         if stats is not None:
             values["stats"] = deepcopy(dict(stats))
         async with self._database.transaction() as session:
+            current, status = await _run_cursor(session, run_id)
+            count = int(
+                await session.scalar(
+                    select(func.count())
+                    .select_from(probe_clusters)
+                    .where(
+                        probe_clusters.c.run_id == run_id,
+                    ),
+                )
+                or 0
+            )
+            target = total_units(count)
+            if current != target or status != "completed":
+                validate_transition(current, target, count)
+            values["progress_unit"] = target
             await session.execute(
                 update(evolution_runs).where(evolution_runs.c.id == run_id).values(**values),
             )

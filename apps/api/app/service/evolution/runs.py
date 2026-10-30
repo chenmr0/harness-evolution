@@ -237,7 +237,9 @@ def _progress(summary: EvolutionRunSummaryRecord) -> EvolutionRunProgress:
     total = total_units(cluster_count)
     validate_cursor(run.progress_unit, cluster_count)
     unit = run.progress_unit
-    if unit < 4:
+    if run.status == "completed" and unit == total:
+        stage_label = "第 6/6 步 · 测试集终评已完成"
+    elif unit < 4:
         stage_label = _RUN_STAGE_LABELS[unit]
     elif unit < 4 + cluster_count:
         stage_label = f"第 5/6 步 · 迭代优化 · 第 {unit - 3}/{cluster_count} 轮"
