@@ -17,6 +17,7 @@ from app.db.models.domain import probe_reports
 from app.service.evolution.prepare import EvolutionPrepareService, RepositoryProbeReader
 from app.service.evolution.skill_core import SkillEvolutionCore
 from app.third_party_api.git.workspace import GitWorkspaceManager
+from app.third_party_api.skill_model import AdapterError, StructuredSkillModel
 
 
 def _run_values(repo_url: str, commit: str) -> dict[str, object]:
@@ -232,3 +233,64 @@ async def test_existing_real_run_cannot_resume_with_placeholder_model(
     )
     with pytest.raises(ValueError, match="refusing placeholder fallback"):
         await disabled.handle(_job(run_id))
+
+
+@pytest.mark.parametrize("recovers", [True, False])
+async def test_cluster_repair_commits_only_a_complete_valid_plan(
+    prepare_state: tuple[Database, EvolutionRepository, EvolutionPrepareService, str, str],
+    tmp_path: Path,
+    recovers: bool,
+) -> None:
+    class RepairModel(Model, StructuredSkillModel):
+        verified = 0
+
+        async def cluster(self, reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return await StructuredSkillModel.cluster(self, reports)
+
+        async def _generate(self, operation: str, data: dict[str, Any], shape: str) -> Any:
+            assert operation == "cluster"
+            self.calls += 1
+            reports = data["reports"]
+            ids = [r["probe_id"] for r in reports]
+            if self.calls == 1 or not recovers:
+                ids.append(ids[0])
+            else:
+                # The second attribute group starts without previous feedback.
+                assert self.calls != 2 or "validation_feedback" in data
+            return [
+                {
+                    "cluster_id": "one",
+                    "attribute_type": reports[0]["attribute_type"],
+                    "probe_ids": ids,
+                    "summary": "Synthetic issue",
+                }
+            ]
+
+        async def verify(
+            self,
+            cluster: dict[str, Any],
+            reports: list[dict[str, Any]],
+            files: dict[str, str],
+        ) -> dict[str, Any]:
+            self.verified += 1
+            return await super().verify(cluster, reports, files)
+
+    database, repository, _, repo_url, commit = prepare_state
+    run_id = "run-m5-09-prepare"
+    await repository.create_run(_run_values(repo_url, commit))
+    model = RepairModel()
+    service = service_for(database, repository, model, tmp_path)
+    if recovers:
+        assert (await service.handle(_job(run_id)))["progressUnit"] == 4
+    else:
+        with pytest.raises(AdapterError, match=r"after 3 attempts.*duplicate_membership"):
+            await service.handle(_job(run_id))
+    state = await SkillEvolutionRepository(database).get(run_id)
+    assert state is not None and len(state.input_snapshot["reports"]) == 2
+    assert ("plan" in state.checkpoint) is recovers
+    assert len(await repository.list_clusters(run_id)) == (2 if recovers else 0)
+    assert len(await repository.list_rounds(run_id)) == (2 if recovers else 0)
+    assert model.calls == 3
+    assert model.verified == (2 if recovers else 0)
+    run = await repository.get_run(run_id)
+    assert run is not None and run.progress_unit == (4 if recovers else 0)

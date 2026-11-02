@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -11,6 +12,9 @@ from typing import Any, cast
 from urllib.parse import urlsplit
 
 import httpx
+
+logger = logging.getLogger(__name__)
+CLUSTER_MAX_ATTEMPTS = 3
 
 
 class AdapterError(RuntimeError):
@@ -126,6 +130,9 @@ def model_prompt(operation: str, shape: str) -> str:
         "attribute_type. "
         "Keep distinct failures separate when they require different rules. Include every "
         "input probe_id exactly once. "
+        "When validation_feedback is supplied, regenerate the COMPLETE partition from reports, "
+        "correcting every listed violation. Cluster indexes in feedback are zero-based. "
+        "Choose one primary cluster for reports spanning multiple problems; never duplicate them. "
         "Do not invent incident details or reinterpret the complaint as a different task. "
         "Summarize each common problem precisely without adding unsupported requirements.",
         "verify": "Inspect the supplied skill files to decide whether the alleged missing "
@@ -199,16 +206,37 @@ class StructuredSkillModel:
         raise NotImplementedError
 
     async def cluster(self, reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        result = await self._generate(
-            "cluster",
-            {"reports": reports},
-            '[{"cluster_id": string, "attribute_type": string, "probe_ids": [string], '
-            '"probe_cluster_description": "shared root problem; group by meaning, not just '
-            'object type"}]',
-        )
-        if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
-            raise AdapterError("Invalid cluster response shape")
-        return result
+        """Repair invalid partitions within a fixed budget before core verification."""
+        from app.service.evolution.skill_core import ClusterValidationError, validate_clusters
+
+        data: dict[str, Any] = {"reports": reports}
+        for attempt in range(1, CLUSTER_MAX_ATTEMPTS + 1):
+            # Transport, cancellation and safety failures must propagate without retries.
+            result = await self._generate(
+                "cluster",
+                data,
+                '[{"cluster_id": string, "attribute_type": string, "probe_ids": [string], '
+                '"probe_cluster_description": "shared root problem; group by meaning, not just '
+                'object type"}]',
+            )
+            try:
+                validated = validate_clusters(result, reports)
+            except ClusterValidationError as exc:
+                logger.warning(
+                    "Skill cluster attempt %d/%d rejected: %s",
+                    attempt,
+                    CLUSTER_MAX_ATTEMPTS,
+                    exc,
+                )
+                if attempt == CLUSTER_MAX_ATTEMPTS:
+                    raise AdapterError(
+                        f"Clustering failed after {attempt} attempts: {exc}",
+                    ) from None
+                data = {"reports": reports, "validation_feedback": exc.feedback}
+            else:
+                logger.info("Skill cluster attempt %d/%d validated", attempt, CLUSTER_MAX_ATTEMPTS)
+                return validated
+        raise AssertionError("cluster attempt budget must be positive")
 
     async def attribute(self, feedback: dict[str, Any], files: dict[str, str]) -> dict[str, Any]:
         from app.service.evolution.skill_contracts import FeedbackAttribution

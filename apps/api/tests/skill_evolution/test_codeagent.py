@@ -63,7 +63,9 @@ assert os.environ['HOME'] == str(Path.cwd())
         ]
     ).replace("sys.stdin.read()", "")
     model = adapter(tmp_path, body)
-    result = await model.cluster([{"probe_id": "probe-1", "description": "business-only-value"}])
+    result = await model.cluster(
+        [{"probe_id": "probe-1", "attribute_type": "prompt", "description": "business-only-value"}],
+    )
     assert result[0]["probe_ids"] == ["probe-1"]
     assert model.last_call is not None and model.last_call["status"] == "succeeded"
     assert model.last_call["usage"]["input_tokens"] == 12
@@ -85,6 +87,30 @@ async def test_cli_shared_operations(tmp_path: Path, operation: str, value: Any)
         assert await model.attribute({}, {}) == value
     else:
         assert await getattr(model, operation)({}, [], {}) == value
+
+
+async def test_cli_repairs_membership_with_feedback_in_separate_call_artifacts(
+    tmp_path: Path,
+) -> None:
+    body = """import json,sys
+data=json.loads(sys.stdin.read().splitlines()[-1])
+ids=[r['probe_id'] for r in data['reports']]
+if 'validation_feedback' not in data:
+    ids.append(ids[0])
+else:
+    assert data['validation_feedback']['counts'] == {'duplicate_membership': 1}
+print(json.dumps({'type':'result','subtype':'success','is_error':False,
+    'structured_output':{'result':[{'cluster_id':'one','attribute_type':'prompt',
+    'probe_ids':ids,'summary':'Issue'}]}}))
+"""
+    model = adapter(tmp_path, body)
+    reports = [{"probe_id": "p1", "attribute_type": "prompt", "probe_description": "Issue"}]
+    assert (await model.cluster(reports))[0]["probe_ids"] == ["p1"]
+    inputs = [json.loads(p.read_text()) for p in (tmp_path / "calls").glob("*/input.json")]
+    assert len(inputs) == 2
+    assert all(item["data"]["reports"] == reports for item in inputs)
+    assert sum("validation_feedback" in item["data"] for item in inputs) == 1
+    assert len(list((tmp_path / "calls").glob("*/result.json"))) == 2
 
 
 @pytest.mark.parametrize(

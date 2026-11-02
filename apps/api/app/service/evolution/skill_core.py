@@ -12,6 +12,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from pydantic import ValidationError
+
 from app.service.evolution.skill_contracts import (
     FeedbackAttribution,
     SkillCluster,
@@ -98,22 +100,75 @@ def deduplicate(reports: list[Json]) -> tuple[list[Json], dict[str, str]]:
     return canonical, aliases
 
 
-def validate_clusters(raw: list[Json], reports: list[Json]) -> list[Json]:
+class ClusterValidationError(ValueError):
+    """Bounded model feedback with a payload-free summary safe for run errors."""
+
+    def __init__(self, counts: dict[str, int], issues: list[Json]) -> None:
+        self.feedback: Json = {
+            "counts": counts,
+            "issues": issues,
+            "issues_truncated": sum(counts.values()) > len(issues),
+        }
+        super().__init__(
+            "invalid cluster output: "
+            + ", ".join(f"{key}={value}" for key, value in counts.items())
+        )
+
+
+def validate_clusters(raw: Any, reports: list[Json]) -> list[Json]:
     """Require exactly-once membership, unique clusters and homogeneous types."""
-    clusters = [SkillCluster.model_validate(item).model_dump(mode="json") for item in raw]
+    # Safety failures are never converted into retryable validation feedback.
+    reject_sensitive_payload(raw)
+    if not isinstance(raw, list):
+        raise ClusterValidationError({"invalid_shape": 1}, [{"code": "invalid_shape"}])
+    clusters = []
+    for index, item in enumerate(raw):
+        try:
+            clusters.append(SkillCluster.model_validate(item).model_dump(mode="json"))
+        except ValidationError:
+            # Do not put Pydantic's raw input values in durable errors or prompts.
+            raise ClusterValidationError(
+                {"invalid_schema": 1},
+                [{"code": "invalid_schema", "cluster_index": index}],
+            ) from None
     expected = {r["probe_id"]: r["attribute_type"] for r in reports}
-    seen: set[str] = set()
+    seen: dict[str, int] = {}
     cluster_ids: set[str] = set()
-    for cluster in clusters:
+    counts: dict[str, int] = {}
+    issues: list[Json] = []
+
+    def record(code: str, **details: Any) -> None:
+        counts[code] = counts.get(code, 0) + 1
+        if len(issues) < 50:
+            issues.append({"code": code, **details})
+
+    for index, cluster in enumerate(clusters):
         if cluster["cluster_id"] in cluster_ids:
-            raise ValueError("duplicate cluster id")
+            record("duplicate_cluster_id", cluster_index=index, cluster_id=cluster["cluster_id"])
         cluster_ids.add(cluster["cluster_id"])
         for probe_id in cluster["probe_ids"]:
-            if probe_id in seen or expected.get(probe_id) != cluster["attribute_type"]:
-                raise ValueError("invalid cluster membership")
-            seen.add(probe_id)
-    if seen != set(expected):
-        raise ValueError("clustering must cover every canonical probe exactly once")
+            if probe_id in seen:
+                record(
+                    "duplicate_membership",
+                    probe_id=probe_id,
+                    cluster_index=index,
+                    first_cluster_index=seen[probe_id],
+                )
+            else:
+                seen[probe_id] = index
+            if probe_id not in expected:
+                record("unknown_probe_id", probe_id=probe_id, cluster_index=index)
+            elif expected[probe_id] != cluster["attribute_type"]:
+                record(
+                    "attribute_mismatch",
+                    probe_id=probe_id,
+                    cluster_index=index,
+                    expected_attribute=expected[probe_id],
+                )
+    for probe_id in sorted(expected.keys() - seen.keys()):
+        record("missing_probe_id", probe_id=probe_id)
+    if counts:
+        raise ClusterValidationError(counts, issues)
     return clusters
 
 

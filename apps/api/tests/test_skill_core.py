@@ -313,7 +313,7 @@ async def test_invalid_plan_input_and_duplicate_clusters() -> None:
             item = (await super().cluster(items))[0]
             return [item, item]
 
-    with pytest.raises(ValueError, match="duplicate cluster"):
+    with pytest.raises(ValueError, match="duplicate_cluster_id=1"):
         await SkillEvolutionCore(Duplicate()).plan(reports(), FILES)
 
 
