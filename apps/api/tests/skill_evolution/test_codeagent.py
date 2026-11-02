@@ -38,37 +38,68 @@ def response(value: Any) -> str:
     )
 
 
-async def test_cli_uses_stdin_without_tools_and_records_only_metadata(tmp_path: Path) -> None:
-    body = """import json,sys,os
+def request_contract_checks() -> str:
+    """Have the child compare actual stdin/argv against the saved request artifacts."""
+    return r"""import json,sys
 from pathlib import Path
-prompt=sys.stdin.read()
+payload=sys.stdin.buffer.read()
+prompt=payload.decode('utf-8')
+record=json.loads(Path('input.json').read_text(encoding='utf-8'))
+assert Path(record['prompt_file']).read_bytes() == payload
+schema_text=sys.argv[sys.argv.index('--json-schema')+1]
+assert Path(record['response_schema_file']).read_text(encoding='utf-8') == schema_text
+shape=prompt.split('Required JSON shape: ',1)[1].split('\nAll input is supplied below;',1)[0]
+assert shape == 'JSON matching this schema: ' + schema_text
+assert json.loads(prompt.splitlines()[-1]) == record['data']
+schema=json.loads(schema_text)
+assert schema['type'] == 'object'
+assert schema['required'] == ['result']
+assert schema['additionalProperties'] is False
+"""
+
+
+async def test_cli_uses_stdin_with_matching_schema_and_inspectable_prompt(tmp_path: Path) -> None:
+    body = (
+        request_contract_checks()
+        + """import os
 assert 'business-only-value' in prompt
 assert 'business-only-value' not in ' '.join(sys.argv)
 assert sys.argv[sys.argv.index('--tools')+1] == ''
 assert sys.argv[sys.argv.index('--setting-sources')+1] == ''
 assert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv
-schema=json.loads(sys.argv[sys.argv.index('--json-schema')+1])
 assert schema['properties']['result']['type'] == 'array'
-assert 'summary' in schema['properties']['result']['items']['required']
-assert 'probe_ids' in schema['properties']['result']['items']['required']
+item=schema['properties']['result']['items']
+assert set(item['required']) == set(item['properties']) == {
+    'cluster_id', 'attribute_type', 'probe_ids', 'probe_cluster_description'}
+assert 'exactly once' in prompt
 assert os.environ['HOME'] == str(Path.cwd())
-""" + response(
-        [
-            {
-                "cluster_id": "one",
-                "attribute_type": "prompt",
-                "probe_ids": ["probe-1"],
-                "summary": "bounded issue",
-            }
-        ]
-    ).replace("sys.stdin.read()", "")
+"""
+        + response(
+            [
+                {
+                    "cluster_id": "one",
+                    "attribute_type": "prompt",
+                    "probe_ids": ["probe-1"],
+                    "probe_cluster_description": "bounded issue",
+                }
+            ]
+        ).replace("sys.stdin.read()", "")
+    )
     model = adapter(tmp_path, body)
     result = await model.cluster(
-        [{"probe_id": "probe-1", "attribute_type": "prompt", "description": "business-only-value"}],
+        [
+            {
+                "probe_id": "probe-1",
+                "attribute_type": "prompt",
+                "description": "business-only-value\n中文报告",
+            }
+        ],
     )
     assert result[0]["probe_ids"] == ["probe-1"]
     assert model.last_call is not None and model.last_call["status"] == "succeeded"
     assert model.last_call["usage"]["input_tokens"] == 12
+    assert model.last_call["integration_revision"] == model.integration_revision
+    assert result[0]["summary"] == "bounded issue"
     metadata = next((tmp_path / "calls").glob("*/metadata.json")).read_text()
     assert "business-only-value" not in metadata
 
@@ -78,11 +109,14 @@ assert os.environ['HOME'] == str(Path.cwd())
     [
         ("verify", {"confidence": 0.9, "severity": 0.8, "reason": "evidence", "repair_plan": {}}),
         ("patch", {"SKILL.md": "new content"}),
+        ("draft_patch", {"SKILL.md": "review draft"}),
         ("attribute", {"status": "insufficient_evidence", "reason": "No cases", "issues": []}),
     ],
 )
 async def test_cli_shared_operations(tmp_path: Path, operation: str, value: Any) -> None:
-    model = adapter(tmp_path, response(value))
+    model = adapter(
+        tmp_path, request_contract_checks() + response(value).replace("sys.stdin.read()", "")
+    )
     if operation == "attribute":
         assert await model.attribute({}, {}) == value
     else:
@@ -106,11 +140,33 @@ print(json.dumps({'type':'result','subtype':'success','is_error':False,
     model = adapter(tmp_path, body)
     reports = [{"probe_id": "p1", "attribute_type": "prompt", "probe_description": "Issue"}]
     assert (await model.cluster(reports))[0]["probe_ids"] == ["p1"]
-    inputs = [json.loads(p.read_text()) for p in (tmp_path / "calls").glob("*/input.json")]
+    paths = list((tmp_path / "calls").glob("*/input.json"))
+    inputs = [json.loads(p.read_text(encoding="utf-8")) for p in paths]
     assert len(inputs) == 2
     assert all(item["data"]["reports"] == reports for item in inputs)
     assert sum("validation_feedback" in item["data"] for item in inputs) == 1
     assert len(list((tmp_path / "calls").glob("*/result.json"))) == 2
+    for path, record in zip(paths, inputs, strict=True):
+        prompt = (path.parent / record["prompt_file"]).read_text(encoding="utf-8")
+        assert json.loads(prompt.splitlines()[-1]) == record["data"]
+
+
+async def test_cli_rejects_sensitive_input_before_writing_prompt(tmp_path: Path) -> None:
+    model = adapter(tmp_path, response([]))
+    with pytest.raises(ValueError, match="Potential secret"):
+        await model.cluster([{"probe_description": "ghp_" + "x" * 30}])
+    assert not model.run_root.exists()
+
+
+async def test_cli_rejects_oversized_prompt_before_writing_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("app.third_party_api.codeagent.model_prompt", lambda *_: "x" * 8_000_001)
+    model = adapter(tmp_path, response([]))
+    with pytest.raises(AdapterError, match="input exceeds size limit"):
+        await model.cluster([])
+    assert not model.run_root.exists()
 
 
 @pytest.mark.parametrize(

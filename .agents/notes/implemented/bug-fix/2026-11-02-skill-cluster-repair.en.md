@@ -14,9 +14,13 @@ The shared HTTP and CodeAgent model boundary generates clusters at most three ti
 
 Each validation outcome enters service logs; terminal failures retain attempt and violation counts. Logs contain neither model prose nor raw identifiers. CodeAgent keeps per-call inputs and outputs in local call directories, with details in repair inputs. Safety failures, transport failures and cancellation propagate directly without correction retries. Only complete valid plans can save a `checkpoint` and advance clusters and rounds.
 
+CodeAgent and HTTP request probe_cluster_description for clusters; summary/reason remain compatible legacy input fields. The CLI prompt uses the complete schema passed to --json-schema, including the result wrapper, to avoid conflicting format descriptions. After safety and size checks, each call saves actual stdin bytes to prompt.txt and its schema to response-schema.json, with filenames in input.json; business content stays out of metadata logs. The adapter revision is codeagent-stdin-v3, allowing model identity checks to prevent saved plans from silently resuming under a different execution policy.
+
 ## Alternatives considered
 
 Relaxing validation, removing duplicates or filling clusters would change semantic membership without verification. Stronger prompts alone cannot guarantee coverage. Retrying all of prepare expands side effects and repeats verification; bounded repair at the model boundary supports both transports while preserving the core guard.
+
+Changing field names in prompt text alone still leaves two output contracts to maintain. Deriving format instructions from the CLI schema eliminates ambiguity in both fields and wrapping. Business input alone cannot reconstruct the instructions received by the model, so prompts and schemas are retained per call.
 
 ## Consequences
 

@@ -30,7 +30,7 @@ from app.third_party_api.skill_model import (
 class CodeAgentModel(StructuredSkillModel):
     """Run stage-scoped CLI calls with no tools, MCP servers or inherited settings."""
 
-    integration_revision = "codeagent-stdin-v2"
+    integration_revision = "codeagent-stdin-v3"
 
     def __init__(
         self,
@@ -89,29 +89,8 @@ class CodeAgentModel(StructuredSkillModel):
         from app.service.evolution.skill_safety import reject_sensitive_payload
 
         reject_sensitive_payload(data)
-        self.run_root.mkdir(parents=True, exist_ok=True)
-        if self.run_root.is_symlink() or self.run_root.resolve() != self.run_root:
-            raise AdapterError("CodeAgent artifact root must not be a symlink")
-        call_id = uuid.uuid4().hex
-        cwd = self.run_root / call_id
-        cwd.mkdir(mode=0o700)
-        (cwd / "input.json").write_text(
-            json.dumps({"operation": operation, "data": data}, ensure_ascii=False),
-            encoding="utf-8",
-        )
-        prompt = (
-            model_prompt(operation, shape)
-            + (
-                "\nReturn an object with exactly one field, result, "
-                "containing the actual stage result. "
-                "All input is supplied below; do not call tools, read files, or execute code.\n"
-            )
-            + json.dumps(data, ensure_ascii=False, allow_nan=False)
-        )
-        # Keep business input out of Windows argv length limits and process listings.
-        payload = prompt.encode("utf-8")
-        if len(payload) > 8_000_000:
-            raise AdapterError("CodeAgent input exceeds size limit")
+        # The CLI schema is the format authority, including the outer result object.
+        # Do not also send the transport-neutral shape, which describes only its value.
         result_schema = _result_schema(operation)
         definitions = result_schema.pop("$defs", {})
         schema = {
@@ -122,6 +101,37 @@ class CodeAgentModel(StructuredSkillModel):
         }
         if definitions:
             schema["$defs"] = definitions
+        schema_json = json.dumps(schema, ensure_ascii=False, allow_nan=False)
+        prompt = (
+            model_prompt(operation, f"JSON matching this schema: {schema_json}")
+            + "\nAll input is supplied below; do not call tools, read files, or execute code.\n"
+            + json.dumps(data, ensure_ascii=False, allow_nan=False)
+        )
+        # Keep business input out of Windows argv length limits and process listings.
+        payload = prompt.encode("utf-8")
+        if len(payload) > 8_000_000:
+            raise AdapterError("CodeAgent input exceeds size limit")
+        self.run_root.mkdir(parents=True, exist_ok=True)
+        if self.run_root.is_symlink() or self.run_root.resolve() != self.run_root:
+            raise AdapterError("CodeAgent artifact root must not be a symlink")
+        call_id = uuid.uuid4().hex
+        cwd = self.run_root / call_id
+        cwd.mkdir(mode=0o700)
+        (cwd / "input.json").write_text(
+            json.dumps(
+                {
+                    "operation": operation,
+                    "data": data,
+                    "prompt_file": "prompt.txt",
+                    "response_schema_file": "response-schema.json",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        # Preserve the actual stdin bytes, including LF on Windows, for local diagnosis.
+        (cwd / "prompt.txt").write_bytes(payload)
+        (cwd / "response-schema.json").write_text(schema_json, encoding="utf-8")
         args = [
             self.executable,
             *([str(self.script_path)] if self.script_path else []),
@@ -141,7 +151,7 @@ class CodeAgentModel(StructuredSkillModel):
             "--setting-sources",
             "",
             "--json-schema",
-            json.dumps(schema),
+            schema_json,
         ]
         if self.model:
             args += ["--model", self.model]
@@ -166,6 +176,7 @@ class CodeAgentModel(StructuredSkillModel):
             "operation": operation,
             "backend": "codeagent",
             "model": self.model,
+            "integration_revision": self.integration_revision,
             "status": "failed",
         }
         self.last_call = metadata
@@ -306,10 +317,9 @@ def _result_schema(operation: str) -> dict[str, Any]:
     if operation == "cluster":
         item = SkillCluster.model_json_schema()
         definitions = item.pop("$defs", {})
-        item["properties"].pop("probe_cluster_description")
+        # Request the same canonical field as HTTP; aliases remain input-compatible.
         for key in ("summary", "reason"):
-            item["properties"][key] = {"type": "string", "minLength": 1, "maxLength": 8000}
-        item["required"] = list(item["properties"])
+            item["properties"].pop(key)
         return {
             "type": "array",
             "minItems": 1,

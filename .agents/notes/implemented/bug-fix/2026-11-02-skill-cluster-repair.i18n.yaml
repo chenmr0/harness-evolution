@@ -1,5 +1,5 @@
 # 双语配对一致性记录（docs/i18n/README.md）：两侧在最后一次确认一致状态下的
 # git blob hash。两种语言同等权威；编辑任一侧后带上另一侧，然后重录：
 #   pnpm run record:i18n -- .agents/notes/implemented/bug-fix/2026-11-02-skill-cluster-repair.md
-2026-11-02-skill-cluster-repair.md: 6d5a68989c8f624d16bcbd0d409f3664b41c2778
-2026-11-02-skill-cluster-repair.en.md: b373e33a62a4260e63eca2ba6c760f84d50a9810
+2026-11-02-skill-cluster-repair.md: a5f01bda9c10106d89dd292b495e855ec9c53e4d
+2026-11-02-skill-cluster-repair.en.md: 46641d8684e3c74cd1530bb4111230dfeaa82822
