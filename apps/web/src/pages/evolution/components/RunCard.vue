@@ -78,7 +78,7 @@ const delta = computed(() => {
   if (!props.run.final) return null;
   const value = props.run.final.bestScore - props.run.final.initScore;
   return {
-    label: `${value >= 0 ? "+" : ""}${value.toFixed(1)}`,
+    label: `${value >= 0 ? "+" : ""}${value.toFixed(2)}`,
     positive: value >= 0,
   };
 });
@@ -208,8 +208,8 @@ function closeError(): void {
       class="final-line"
     >
       <span>
-        best <b class="mono">{{ run.final.bestScore.toFixed(1) }}</b>
-        vs 初始 <b class="mono">{{ run.final.initScore.toFixed(1) }}</b>
+        best <b class="mono">{{ run.final.bestScore.toFixed(2) }}</b>
+        vs 初始 <b class="mono">{{ run.final.initScore.toFixed(2) }}</b>
       </span>
       <b
         class="delta mono"

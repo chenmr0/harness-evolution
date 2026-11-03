@@ -51,8 +51,15 @@ function independentMetrics(item: Record<string, unknown>): Metric[] {
   }
   const delta = item.candidateScore - item.currentScore;
   if (!isScore(delta)) return [];
+  const hard = evidence.current.scoreMetric === "hard" && evidence.candidate.scoreMetric === "hard";
   return [
-    { name: "total_score 均值", init: item.currentScore, best: item.candidateScore, delta, unit: "" },
+    {
+      name: hard ? "hard 均分" : "total_score 均值",
+      init: hard ? item.currentScore.toFixed(2) : item.currentScore,
+      best: hard ? item.candidateScore.toFixed(2) : item.candidateScore,
+      delta,
+      unit: "",
+    },
     ...rows,
   ];
 }
@@ -83,11 +90,11 @@ const metrics = computed(() =>
 );
 
 function deltaLabel(delta: number, unit = ""): string {
-  return `${delta >= 0 ? "+" : ""}${delta.toFixed(1)}${unit}`;
+  return `${delta >= 0 ? "+" : ""}${delta.toFixed(2)}${unit}`;
 }
 
 function score(value: number | null): string {
-  return value === null ? "—" : value.toFixed(1);
+  return value === null ? "—" : value.toFixed(2);
 }
 
 function typeLabel(type: string): string {

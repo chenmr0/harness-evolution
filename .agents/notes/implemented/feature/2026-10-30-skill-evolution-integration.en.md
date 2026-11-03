@@ -10,7 +10,7 @@ The existing evolution flow has task state and Git workspaces, but clustering, c
 
 ## Decision
 
-Integrate Skill clustering, deduplication, verification, ranking, patches, and feedback into the existing task flow. Preserve immutable input snapshots and revision-checked process state. Candidates use Git branches for evaluation; acceptance requires a strict increase in the arithmetic mean of total_score across matching cases. Retest the baseline and best version independently at the end. Real model and evaluation services are explicitly enabled and configured by the server; credentials are read from the environment and not stored in task snapshots. Historical data is not migrated.
+Integrate Skill clustering, deduplication, verification, ranking, patches, and feedback into the existing task flow. Preserve immutable input snapshots and revision-checked process state. Candidates use Git branches for evaluation; acceptance requires a strict increase in the mean over all hard observations in the report, rounded half up to two decimals, across matching sets of scored cases. Each hard occurrence counts, including repeats within a case. Other metrics do not count and an empty hard set has no score. Raw metrics remain available for audit. Retest the baseline and best version independently at the end. Real model and evaluation services are explicitly enabled and configured by the server; credentials are read from the environment and not stored in task snapshots. Historical data is not migrated.
 
 ## Configuration and operation
 

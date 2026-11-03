@@ -27,7 +27,7 @@ def completed(*scores: Any) -> dict[str, Any]:
         "report": {
             "metrics": [
                 {
-                    "key": "total_score",
+                    "key": "hard",
                     "value": score,
                     "tags": {"metric_type": "case", "case_name": f"case-{index}"},
                 }
@@ -97,9 +97,9 @@ def test_missing_or_invalid_case_results_fail(body: dict[str, Any]) -> None:
         parse_case_score(body)
 
 
-def test_duplicate_missing_and_incomplete_cases_fail() -> None:
-    duplicate = completed(2)
-    duplicate["report"]["metrics"] *= 2
+def test_hard_occurrences_and_incomplete_reports() -> None:
+    duplicate = completed(1, 0)
+    duplicate["report"]["metrics"].append(duplicate["report"]["metrics"][0])
     missing = completed(2)
     missing["report"]["metrics"].append(
         {
@@ -112,9 +112,50 @@ def test_duplicate_missing_and_incomplete_cases_fail() -> None:
     incomplete["report"]["cases_complete"] = False
     count_mismatch = completed(2)
     count_mismatch["report"]["case_count"] = 2
-    for body in (duplicate, missing, incomplete, count_mismatch):
+    assert parse_case_score(duplicate).score == 0.67
+    assert CaseScore.from_payload(parse_case_score(duplicate).to_payload()).score == 0.67
+    assert parse_case_score(missing).score == 2
+    for body in (incomplete, count_mismatch):
         with pytest.raises(EvaluationError):
             parse_case_score(body)
+
+
+def test_real_report_counts_only_hard_occurrences() -> None:
+    body = completed(0, 1, 0, 1)
+    metrics = body["report"]["metrics"]
+    metrics.extend(
+        [
+            {"key": "soft", "value": 0.5, "tags": {"metric_type": "case", "case_name": "case-1"}},
+            {
+                "key": "matched",
+                "value": "false",
+                "tags": {"metric_type": "case", "case_name": "case-2"},
+            },
+            {
+                "key": "token消耗",
+                "value": 3014030,
+                "tags": {
+                    "metric_type": "case",
+                    "case_name": "case45",
+                    "parent_case_name_array_json": [],
+                },
+            },
+            {
+                "key": "total_score",
+                "value": 99,
+                "tags": {"metric_type": "case", "case_name": "case-1"},
+            },
+        ]
+    )
+    parsed = parse_case_score(body)
+    assert parsed.score == 0.50
+    assert "case45" not in parsed.case_ids
+    assert CaseScore.from_payload(parsed.to_payload()) == parsed
+    assert parse_case_score(completed(1, 0, 0)).score == 0.33
+    assert parse_case_score(completed(0.125)).score == 0.13
+    assert not compare_case_scores(
+        parse_case_score(completed(0.331)), parse_case_score(completed(0.334))
+    )
 
 
 def test_strict_comparable_mean_and_persisted_evidence() -> None:
@@ -533,8 +574,8 @@ async def test_pair_wait_failure_unknown_id_and_cas_conflict() -> None:
     "metric",
     [
         None,
-        {"key": "total_score", "value": 5},
-        {"key": "total_score", "value": 5, "tags": {"metric_type": "unknown"}},
+        {"key": "hard", "value": 5},
+        {"key": "hard", "value": 5, "tags": {"metric_type": "unknown"}},
         {"key": "duration", "value": 5, "tags": {"metric_type": "case"}},
     ],
 )
@@ -545,16 +586,16 @@ def test_malformed_metrics_fail(metric: Any) -> None:
         parse_case_score(body)
 
 
-def test_global_score_ignored_and_bad_case_coverage_not_invented() -> None:
+def test_all_hard_entries_contribute_and_bad_case_coverage_not_invented() -> None:
     body = completed(2, 4)
     body["report"]["metrics"].append(
         {
-            "key": "total_score",
+            "key": "hard",
             "value": 999,
             "tags": {"metric_type": "global"},
         }
     )
-    assert parse_case_score(body).score == 3
+    assert parse_case_score(body).score == 335
     body["report"]["bad_cases_complete"] = True
     with pytest.raises(EvaluationError):
         parse_case_score(body)

@@ -7,7 +7,8 @@ import math
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Any
+from decimal import ROUND_HALF_UP, Decimal, localcontext
+from typing import Any, Literal
 
 from app.utils.redaction import redact_text
 
@@ -31,10 +32,12 @@ class CaseScore:
     case_scores: tuple[tuple[str, float], ...]
     report: dict[str, Any] = field(default_factory=dict)
 
+    metric_key: Literal["total_score", "hard"] = "total_score"
+
     def __post_init__(self) -> None:
         """Reject missing, duplicate, blank and nonfinite case evidence."""
         if not self.case_scores:
-            raise InvalidEvaluationEvidence("Completed evaluation has no case total_score metrics")
+            raise InvalidEvaluationEvidence("Completed evaluation has no evaluated cases")
         names: set[str] = set()
         for name, score in self.case_scores:
             if not isinstance(name, str) or not name.strip() or name in names:
@@ -54,7 +57,11 @@ class CaseScore:
 
     @property
     def score(self) -> float:
-        """Return the unweighted arithmetic mean of every case total_score."""
+        """Use the original metric for archived results and hundredths for hard scores."""
+        if self.metric_key == "hard":
+            return _hard_mean(
+                [metric["value"] for metric in self.report["metrics"] if metric["key"] == "hard"]
+            )
         # Divide before summing to avoid overflow for valid large finite scores.
         return math.fsum(value / len(self.case_scores) for _, value in self.case_scores)
 
@@ -67,6 +74,7 @@ class CaseScore:
         """Serialize sufficient evidence to recompute scores after process restart."""
         return {
             "score": self.score,
+            "scoreMetric": self.metric_key,
             "caseScores": dict(self.case_scores),
             "report": deepcopy(self.report),
         }
@@ -80,22 +88,40 @@ class CaseScore:
         report = payload.get("report", {})
         if not isinstance(report, dict):
             raise InvalidEvaluationEvidence("Evaluation report evidence is invalid")
-        result = cls(tuple(cases.items()), deepcopy(report))
+        key = payload.get("scoreMetric", "total_score")
+        if key not in ("hard", "total_score"):
+            raise InvalidEvaluationEvidence("Unknown evaluation score metric")
+        if key == "hard":
+            result = parse_case_score({"status": "completed", "report": report})
+            if dict(result.case_scores) != cases:
+                raise InvalidEvaluationEvidence("Evaluation case evidence disagrees with report")
+        else:
+            result = cls(tuple(cases.items()), deepcopy(report))
         score = payload.get("score")
         if type(score) not in (int, float) or score != result.score:
             raise InvalidEvaluationEvidence("Evaluation aggregate disagrees with case evidence")
         return result
 
 
+def _hard_mean(values: list[float]) -> float:
+    """Round the mean of hard observations, weighting each occurrence equally."""
+    if not values:
+        raise InvalidEvaluationEvidence("Completed evaluation has no case hard metrics")
+    with localcontext() as context:
+        context.prec = 340
+        total = sum((Decimal(str(value)) for value in values), Decimal(0))
+        return float((total / len(values)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def compare_case_scores(current: CaseScore, candidate: CaseScore) -> bool:
     """Accept strictly greater means only when both evaluated exactly the same cases."""
-    if current.case_ids != candidate.case_ids:
+    if current.metric_key != candidate.metric_key or current.case_ids != candidate.case_ids:
         raise InvalidEvaluationEvidence("Evaluation case sets are not comparable")
     return candidate.score > current.score
 
 
 def parse_case_score(body: Mapping[str, Any]) -> CaseScore:
-    """Normalize the platform's completed report.metrics case total_score entries."""
+    """Normalize the platform's completed report.metrics case hard scores."""
     if str(body.get("status", "")).casefold() != "completed":
         raise InvalidEvaluationEvidence("Evaluation result is not completed")
     report = body.get("report")
@@ -107,7 +133,7 @@ def parse_case_score(body: Mapping[str, Any]) -> CaseScore:
     metrics = report.get("metrics")
     if not isinstance(metrics, list) or not metrics or len(metrics) > 10000:
         raise InvalidEvaluationEvidence("Completed evaluation omitted valid metrics")
-    cases: list[tuple[str, float]] = []
+    cases: dict[str, list[float]] = {}
     reported_cases: set[str] = set()
     for metric in metrics:
         if not isinstance(metric, dict) or not isinstance(metric.get("key"), str):
@@ -118,14 +144,10 @@ def parse_case_score(body: Mapping[str, Any]) -> CaseScore:
             if not isinstance(name, str) or not name.strip():
                 raise InvalidEvaluationEvidence("Evaluation case metric lacks identity")
             reported_cases.add(name)
-        if metric["key"] != "total_score":
+        if metric["key"] != "hard":
             continue
         if not isinstance(tags, dict):
-            raise InvalidEvaluationEvidence("Evaluation total_score tags are invalid")
-        if tags.get("metric_type") == "global":
-            continue
-        if tags.get("metric_type") != "case" or not isinstance(tags.get("case_name"), str):
-            raise InvalidEvaluationEvidence("Evaluation total_score lacks case identity")
+            raise InvalidEvaluationEvidence("Evaluation hard metric tags are invalid")
         score = metric.get("value")
         if (
             isinstance(score, bool)
@@ -133,12 +155,17 @@ def parse_case_score(body: Mapping[str, Any]) -> CaseScore:
             or not math.isfinite(score)
         ):
             raise InvalidEvaluationEvidence("Evaluation case score must be finite and numeric")
-        cases.append((tags["case_name"], float(score)))
-    result = CaseScore(tuple(cases), _validated_report(report))
-    if reported_cases != set(result.case_ids):
-        raise InvalidEvaluationEvidence("Evaluation case results omit total_score metrics")
+        if tags.get("metric_type") == "global":
+            continue
+        if tags.get("metric_type") != "case" or not isinstance(tags.get("case_name"), str):
+            raise InvalidEvaluationEvidence("Evaluation hard metric lacks case identity")
+        cases.setdefault(tags["case_name"], []).append(float(score))
+    if not cases:
+        raise InvalidEvaluationEvidence("Completed evaluation has no case hard metrics")
+    scores = tuple((name, _hard_mean(values)) for name, values in cases.items())
+    result = CaseScore(scores, _validated_report(report), "hard")
     if "case_count" in report and (
-        type(report["case_count"]) is not int or report["case_count"] != len(result.case_ids)
+        type(report["case_count"]) is not int or report["case_count"] != len(reported_cases)
     ):
         raise InvalidEvaluationEvidence("Evaluation case count is incomplete or inconsistent")
     return result
@@ -150,11 +177,18 @@ def _validated_report(report: dict[str, Any]) -> dict[str, Any]:
         value = metric.get("value")
         tags = metric.get("tags")
         if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(value)
+            not isinstance(value, (str, int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
             or not isinstance(tags, dict)
-            or not all(isinstance(k, str) and isinstance(v, str) for k, v in tags.items())
+            or not all(
+                isinstance(v, str)
+                or (
+                    k == "parent_case_name_array_json"
+                    and isinstance(v, list)
+                    and all(isinstance(parent, str) for parent in v)
+                )
+                for k, v in tags.items()
+            )
         ):
             raise InvalidEvaluationEvidence("Evaluation report metric is malformed")
     if "bad_cases" in report:

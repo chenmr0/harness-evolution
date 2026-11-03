@@ -72,7 +72,8 @@ class HttpEvaluationClient:
     def integration_identity(self) -> str:
         """Bind durable provider IDs to a non-secret endpoint/protocol identity."""
         return hashlib.sha256(
-            json.dumps(["case-mean-v1", self._base_url, self._expected]).encode()
+
+            json.dumps(["hard-case-mean-v2", self._base_url, self._expected]).encode()
         ).hexdigest()
 
     def validate_submission(self, ref: str, template_id: str, idempotency_key: str) -> None:

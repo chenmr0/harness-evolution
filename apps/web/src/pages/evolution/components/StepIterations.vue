@@ -48,7 +48,7 @@ function delta(round: StepRound): number | null {
 function deltaLabel(round: StepRound): string {
   const value = delta(round);
   if (value === null) return "—";
-  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}`;
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
 }
 
 function statusLabel(round: StepRound): string {

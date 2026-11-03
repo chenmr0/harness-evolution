@@ -336,9 +336,9 @@ describe("evolution step content", () => {
     });
     expect(wrapper.findAll("tbody tr").map((row) => row.findAll("td").map((cell) => cell.text())))
       .toEqual([
-        ["total_score 均值", "5", "7", "+2.0"],
-        ["用例 case1", "3", "7", "+4.0"],
-        ["用例 case2", "7", "7", "+0.0"],
+        ["total_score 均值", "5", "7", "+2.00"],
+        ["用例 case1", "3", "7", "+4.00"],
+        ["用例 case2", "7", "7", "+0.00"],
       ]);
     expect(wrapper.text()).not.toContain("终评指标暂不可用");
     expect(wrapper.text()).toContain("来源 2 个问题");

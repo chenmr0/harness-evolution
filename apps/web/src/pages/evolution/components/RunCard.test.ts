@@ -135,9 +135,9 @@ describe("RunCard", () => {
 
     expect(wrapper.get(".badge").text()).toBe("✓ 已完成 · 自进化有效");
     expect(wrapper.get(".final-line").text()).toContain(
-      "best 88.9 vs 初始 84.3",
+      "best 88.90 vs 初始 84.30",
     );
-    expect(wrapper.get(".final-line").text()).toContain("+4.6");
+    expect(wrapper.get(".final-line").text()).toContain("+4.60");
     expect(wrapper.get(".final-line").text()).toContain("接纳 1/2 个 patch");
     expect(wrapper.find("[role='progressbar']").exists()).toBe(false);
   });

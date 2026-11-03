@@ -284,10 +284,11 @@ class LocalEvaluation:
         score = 10.0 + content.count("IMPROVEMENT") * 10 - content.count("REGRESSION") * 30
         return CaseScore(
             (("case1", score),),
+            metric_key="hard",
             report={
                 "metrics": [
                     {
-                        "key": "total_score",
+                        "key": "hard",
                         "value": score,
                         "tags": {"metric_type": "case", "case_name": "case1"},
                     }

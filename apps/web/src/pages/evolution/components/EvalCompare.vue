@@ -55,7 +55,7 @@ function widthFor(value: number | null): string {
 }
 
 function score(value: number | null): string {
-  return value === null ? "—" : value.toFixed(1);
+  return value === null ? "—" : value.toFixed(2);
 }
 </script>
 
