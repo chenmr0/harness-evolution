@@ -39,7 +39,7 @@ Fix the final cursor, input statistics, and wizard count semantics; integrate an
 
 ## Implementation
 
-Advance progress in the completion transaction, derive counts from frozen input, and separate reports from source problems. CLI and HTTP models share operation contracts. Send input over stdin, disable tools and MCP, bound time and output, and clean up descendants.
+Advance progress in the completion transaction, derive counts from frozen input, and separate reports from source problems. CLI and HTTP models share operation contracts. Send input over stdin, enable only the stage-specific MCP tool, bound time and output, and clean up descendants.
 
 ## Implementation steps
 

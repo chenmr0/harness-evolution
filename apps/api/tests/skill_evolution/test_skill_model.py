@@ -31,9 +31,18 @@ async def test_real_model_uses_structured_plan_and_replacements(
         return httpx.Response(
             200,
             json={
-                "stop_reason": "end_turn",
+                "stop_reason": "tool_use",
                 "content": [
-                    {"type": "text", "text": '{"SKILL.md":"# Better\\n"}'},
+                    {
+                        "type": "tool_use",
+                        "name": "submit_edits",
+                        "id": "req1",
+                        "input": {
+                            "edits": [
+                                {"action": "replace", "file": 1, "old": "Old", "new": "Better\n"}
+                            ]
+                        },
+                    },
                 ],
             },
         )

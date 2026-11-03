@@ -247,7 +247,7 @@ async def test_cluster_repair_commits_only_a_complete_valid_plan(
         async def cluster(self, reports: list[dict[str, Any]]) -> list[dict[str, Any]]:
             return await StructuredSkillModel.cluster(self, reports)
 
-        async def _generate(self, operation: str, data: dict[str, Any], shape: str) -> Any:
+        async def _generate(self, operation: str, data: dict[str, Any]) -> Any:
             assert operation == "cluster"
             self.calls += 1
             reports = data["reports"]

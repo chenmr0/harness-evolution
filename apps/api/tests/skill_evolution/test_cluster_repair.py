@@ -86,7 +86,7 @@ class Model(StructuredSkillModel):
         self.calls: list[dict[str, Any]] = []
         self.verified: list[str] = []
 
-    async def _generate(self, operation: str, data: dict[str, Any], shape: str) -> Any:
+    async def _generate(self, operation: str, data: dict[str, Any]) -> Any:
         assert operation == "cluster"
         self.calls.append(copy.deepcopy(data))
         output = self.outputs[len(self.calls) - 1]
@@ -175,16 +175,20 @@ async def test_http_transport_receives_feedback_and_complete_reports(
 
     async def respond(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
-        calls.append(json.loads(body["messages"][0]["content"]))
-        assert "validation_feedback" in body["system"]
-        raw = (
-            invalid_partition() if len(calls) == 1 else [cluster([r["probe_id"] for r in REPORTS])]
-        )
+        calls.append(body)
+        ids = list(range(1, 28)) if len(calls) > 1 else [1, 1]
         return httpx.Response(
             200,
             json={
-                "stop_reason": "end_turn",
-                "content": [{"type": "text", "text": json.dumps(raw)}],
+                "stop_reason": "tool_use",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "req",
+                        "name": "submit_clusters",
+                        "input": {"groups": [{"reason": "Issue", "members": ids}]},
+                    }
+                ],
             },
         )
 
@@ -193,5 +197,5 @@ async def test_http_transport_receives_feedback_and_complete_reports(
         result = await model.cluster(REPORTS)
     assert len(result[0]["probe_ids"]) == 27
     assert len(calls) == 2
-    assert calls[1]["reports"] == REPORTS
-    assert calls[1]["validation_feedback"]["counts"]["missing_probe_id"] == 10
+    assert calls[1]["messages"][0] == calls[0]["messages"][0]
+    assert "missing=" in calls[1]["messages"][-1]["content"][0]["content"]

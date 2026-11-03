@@ -1,5 +1,5 @@
 # 双语配对一致性记录（docs/i18n/README.md）：两侧在最后一次确认一致状态下的
 # git blob hash。两种语言同等权威；编辑任一侧后带上另一侧，然后重录：
 #   pnpm run record:i18n -- .agents/notes/implemented/feature/2026-10-30-skill-evolution-integration.md
-2026-10-30-skill-evolution-integration.md: 976ceae1cdcac0b9abab4206f7aa3f498e3bb634
-2026-10-30-skill-evolution-integration.en.md: 9b98cfe4248876c863b860f7ddc35d332aa710f5
+2026-10-30-skill-evolution-integration.md: 3eb33be5c89e6842ee3595badc9ee8574cc73f48
+2026-10-30-skill-evolution-integration.en.md: f1d3a3d118b7a3ab3cee15e80e702569fcf92c49

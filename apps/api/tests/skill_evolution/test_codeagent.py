@@ -38,117 +38,96 @@ def response(value: Any) -> str:
     )
 
 
-def request_contract_checks() -> str:
-    """Have the child compare actual stdin/argv against the saved request artifacts."""
-    return r"""import json,sys
+def tool_client() -> str:
+    return r"""import json,sys,subprocess
 from pathlib import Path
-payload=sys.stdin.buffer.read()
-prompt=payload.decode('utf-8')
+prompt=sys.stdin.buffer.read()
 record=json.loads(Path('input.json').read_text(encoding='utf-8'))
-assert Path(record['prompt_file']).read_bytes() == payload
-schema_text=sys.argv[sys.argv.index('--json-schema')+1]
-assert Path(record['response_schema_file']).read_text(encoding='utf-8') == schema_text
-shape=prompt.split('Required JSON shape: ',1)[1].split('\nAll input is supplied below;',1)[0]
-assert shape == 'JSON matching this schema: ' + schema_text
-assert json.loads(prompt.splitlines()[-1]) == record['data']
-schema=json.loads(schema_text)
-assert schema['type'] == 'object'
-assert schema['required'] == ['result']
-assert schema['additionalProperties'] is False
-"""
-
-
-async def test_cli_uses_stdin_with_matching_schema_and_inspectable_prompt(tmp_path: Path) -> None:
-    body = (
-        request_contract_checks()
-        + """import os
-assert 'business-only-value' in prompt
-assert 'business-only-value' not in ' '.join(sys.argv)
+assert Path(record['prompt_file']).read_bytes()==prompt
 assert sys.argv[sys.argv.index('--tools')+1] == ''
-assert sys.argv[sys.argv.index('--setting-sources')+1] == ''
-assert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv
-assert schema['properties']['result']['type'] == 'array'
-item=schema['properties']['result']['items']
-assert set(item['required']) == set(item['properties']) == {
-    'cluster_id', 'attribute_type', 'probe_ids', 'probe_cluster_description'}
-assert 'exactly once' in prompt
-assert os.environ['HOME'] == str(Path.cwd())
+mcp=json.loads(Path(sys.argv[sys.argv.index('--mcp-config')+1]).read_text())['mcpServers']['skill']
+server=subprocess.Popen([mcp['command'],*mcp['args']],
+    stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+def send(method,params):
+    server.stdin.write(json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params})+'\n')
+    server.stdin.flush()
+    return json.loads(server.stdout.readline())['result']
+tools=send('tools/list',{})['tools']
+assert len(tools)==1
+tool=tools[0]['name']
+assert 'mcp__skill__'+tool in sys.argv
+assert json.loads(Path(record['response_schema_file']).read_text())==tools[0]['inputSchema']
+def submit(args):
+    return send('tools/call',{'name':tool,'arguments':args})
 """
-        + response(
-            [
-                {
-                    "cluster_id": "one",
-                    "attribute_type": "prompt",
-                    "probe_ids": ["probe-1"],
-                    "probe_cluster_description": "bounded issue",
-                }
-            ]
-        ).replace("sys.stdin.read()", "")
-    )
-    model = adapter(tmp_path, body)
-    result = await model.cluster(
-        [
-            {
-                "probe_id": "probe-1",
-                "attribute_type": "prompt",
-                "description": "business-only-value\n中文报告",
-            }
-        ],
-    )
-    assert result[0]["probe_ids"] == ["probe-1"]
-    assert model.last_call is not None and model.last_call["status"] == "succeeded"
-    assert model.last_call["usage"]["input_tokens"] == 12
-    assert model.last_call["integration_revision"] == model.integration_revision
-    assert result[0]["summary"] == "bounded issue"
-    metadata = next((tmp_path / "calls").glob("*/metadata.json")).read_text()
-    assert "business-only-value" not in metadata
 
 
-@pytest.mark.parametrize(
-    "operation,value",
-    [
-        ("verify", {"confidence": 0.9, "severity": 0.8, "reason": "evidence", "repair_plan": {}}),
-        ("patch", {"SKILL.md": "new content"}),
-        ("draft_patch", {"SKILL.md": "review draft"}),
-        ("attribute", {"status": "insufficient_evidence", "reason": "No cases", "issues": []}),
-    ],
-)
-async def test_cli_shared_operations(tmp_path: Path, operation: str, value: Any) -> None:
-    model = adapter(
-        tmp_path, request_contract_checks() + response(value).replace("sys.stdin.read()", "")
-    )
-    if operation == "attribute":
-        assert await model.attribute({}, {}) == value
+@pytest.mark.parametrize("operation", ["verify", "patch", "draft_patch", "attribute"])
+async def test_cli_shared_operations(tmp_path: Path, operation: str) -> None:
+    value: dict[str, Any]
+    if operation == "verify":
+        value = {
+            "confidence": 0.9,
+            "severity": 0.8,
+            "reason": "evidence",
+            "repair_plan": {"objective": "review", "changes": [], "validation_checks": ["inspect"]},
+        }
+    elif operation == "attribute":
+        value = {"status": "insufficient_evidence", "reason": "No cases", "issues": []}
     else:
-        assert await getattr(model, operation)({}, [], {}) == value
-
-
-async def test_cli_repairs_membership_with_feedback_in_separate_call_artifacts(
-    tmp_path: Path,
-) -> None:
-    body = """import json,sys
-data=json.loads(sys.stdin.read().splitlines()[-1])
-ids=[r['probe_id'] for r in data['reports']]
-if 'validation_feedback' not in data:
-    ids.append(ids[0])
-else:
-    assert data['validation_feedback']['counts'] == {'duplicate_membership': 1}
-print(json.dumps({'type':'result','subtype':'success','is_error':False,
-    'structured_output':{'result':[{'cluster_id':'one','attribute_type':'prompt',
-    'probe_ids':ids,'summary':'Issue'}]}}))
-"""
+        value = {"edits": [{"action": "replace", "file": 1, "old": "old", "new": "better"}]}
+    body = tool_client() + f"assert not submit({value!r})['isError']\n" + response(None)
     model = adapter(tmp_path, body)
-    reports = [{"probe_id": "p1", "attribute_type": "prompt", "probe_description": "Issue"}]
-    assert (await model.cluster(reports))[0]["probe_ids"] == ["p1"]
-    paths = list((tmp_path / "calls").glob("*/input.json"))
-    inputs = [json.loads(p.read_text(encoding="utf-8")) for p in paths]
-    assert len(inputs) == 2
-    assert all(item["data"]["reports"] == reports for item in inputs)
-    assert sum("validation_feedback" in item["data"] for item in inputs) == 1
-    assert len(list((tmp_path / "calls").glob("*/result.json"))) == 2
-    for path, record in zip(paths, inputs, strict=True):
-        prompt = (path.parent / record["prompt_file"]).read_text(encoding="utf-8")
-        assert json.loads(prompt.splitlines()[-1]) == record["data"]
+    if operation == "attribute":
+        assert await model.attribute({"evidence": []}, {}) == value
+    else:
+        result = await getattr(model, operation)({}, [], {"SKILL.md": "# old"})
+        if operation == "verify":
+            assert result["repair_plan"]["objective"] == "review"
+        else:
+            assert result == {"SKILL.md": "# better"}
+
+
+@pytest.mark.parametrize("recover", [True, False])
+async def test_cluster_tool_enforces_three_submissions(tmp_path: Path, recover: bool) -> None:
+    body = r"""import json,sys,subprocess
+from pathlib import Path
+prompt=sys.stdin.buffer.read().decode()
+assert 'probe-long-id' not in prompt
+assert sys.argv[sys.argv.index('--tools')+1] == ''
+assert '--restricted' in sys.argv and '--strict-mcp-config' in sys.argv
+mcp=json.loads(Path(sys.argv[sys.argv.index('--mcp-config')+1]).read_text())['mcpServers']['skill']
+server=subprocess.Popen([mcp['command'],*mcp['args']],
+    stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+def send(method,params):
+    server.stdin.write(json.dumps({'jsonrpc':'2.0','id':1,'method':method,'params':params})+'\n')
+    server.stdin.flush()
+    return json.loads(server.stdout.readline())['result']
+tools=send('tools/list',{})['tools']
+assert [t['name'] for t in tools]==['submit_clusters']
+def submit(members):
+    groups=[{'reason':'Sample','members':members}]
+    return send('tools/call',{'name':'submit_clusters','arguments':{'groups':groups}})
+for i in range(2):
+    r=submit([1,1])
+    assert r['isError'] and 'duplicate=[1]' in str(r) and 'missing=[2]' in str(r)
+last=submit([1,2] if RECOVER else [1,1])
+assert last['isError'] != RECOVER
+if not RECOVER:
+    assert 'limit reached' in str(submit([1,2]))
+server.stdin.close()
+server.wait()
+print(json.dumps({'type':'result','subtype':'success'}))
+""".replace("RECOVER", str(recover))
+    model = adapter(tmp_path, body)
+    reports = [{"probe_id": f"probe-long-id-{i}", "attribute_type": "prompt"} for i in (1, 2)]
+    if recover:
+        result = await model.cluster(reports)
+        assert result[0]["probe_ids"] == [r["probe_id"] for r in reports]
+    else:
+        with pytest.raises(AdapterError, match="after 3 attempts"):
+            await model.cluster(reports)
+    assert len(list(model.run_root.glob("*/submission-*.json"))) == 3
 
 
 async def test_cli_rejects_sensitive_input_before_writing_prompt(tmp_path: Path) -> None:
@@ -174,7 +153,7 @@ async def test_cli_rejects_oversized_prompt_before_writing_artifacts(
     [
         ("import sys; sys.stdin.read(); print('not-json')", "invalid JSON"),
         (response({}).replace('"is_error": false', '"is_error": true'), "complete successfully"),
-        (response({}).replace('"structured_output"', '"missing"'), "structured result"),
+        (response({}).replace('"structured_output"', '"missing"'), "tool not called"),
         ("import sys; sys.stdin.read(); sys.exit(2)", "exited unsuccessfully"),
         (response({}) + response({}), "complete successfully"),
     ],
@@ -183,7 +162,7 @@ async def test_cli_rejects_failed_or_malformed_results(
     tmp_path: Path, body: str, message: str
 ) -> None:
     with pytest.raises(AdapterError, match=message):
-        await adapter(tmp_path, body).cluster([])
+        await adapter(tmp_path, body).verify({}, [], {})
 
 
 async def test_cli_bounds_output_and_time(tmp_path: Path) -> None:
@@ -217,11 +196,12 @@ async def test_cli_disabled_and_secrets_rejected(
     monkeypatch.setenv("TEST_PROVIDER_TOKEN", "fixture-credential-value")
     model = adapter(
         tmp_path,
-        response([{"summary": "fixture-credential-value"}]),
+        tool_client() + "submit(dict(status='insufficient_evidence',"
+        "reason='fixture-credential-value',issues=[]))\n" + response(None),
         env_names=("TEST_PROVIDER_TOKEN",),
     )
     with pytest.raises(AdapterError, match="credential"):
-        await model.cluster([])
+        await model.attribute({"evidence": []}, {})
 
 
 def test_cli_configuration_is_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

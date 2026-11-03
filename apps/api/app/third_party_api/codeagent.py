@@ -28,9 +28,9 @@ from app.third_party_api.skill_model import (
 
 
 class CodeAgentModel(StructuredSkillModel):
-    """Run stage-scoped CLI calls with no tools, MCP servers or inherited settings."""
+    """Run stage-scoped CLI calls with one trusted submission tool and isolated settings."""
 
-    integration_revision = "codeagent-stdin-v3"
+    integration_revision = "codeagent-submit-v4"
 
     def __init__(
         self,
@@ -82,30 +82,22 @@ class CodeAgentModel(StructuredSkillModel):
         self.integration_revision = hashlib.sha256(json.dumps(identity).encode()).hexdigest()
         self.base_url = os.environ.get("ANTHROPIC_BASE_URL")
 
-    async def _generate(self, operation: str, data: dict[str, Any], shape: str) -> Any:
+    async def _generate(self, operation: str, data: dict[str, Any]) -> Any:
         """Request a structured result; persist bounded metadata without provider logs."""
         if not self.enabled:
             raise AdapterError("CodeAgent is disabled")
         from app.service.evolution.skill_safety import reject_sensitive_payload
 
         reject_sensitive_payload(data)
-        # The CLI schema is the format authority, including the outer result object.
-        # Do not also send the transport-neutral shape, which describes only its value.
-        result_schema = _result_schema(operation)
-        definitions = result_schema.pop("$defs", {})
-        schema = {
-            "type": "object",
-            "required": ["result"],
-            "additionalProperties": False,
-            "properties": {"result": result_schema},
-        }
-        if definitions:
-            schema["$defs"] = definitions
-        schema_json = json.dumps(schema, ensure_ascii=False, allow_nan=False)
+        from app.third_party_api.skill_submission import TOOLS, submission_input
+
+        name, submission_type = TOOLS[operation]
+        tool_name = "mcp__skill__" + name
+        schema_json = json.dumps(submission_type.model_json_schema(), ensure_ascii=False)
         prompt = (
-            model_prompt(operation, f"JSON matching this schema: {schema_json}")
-            + "\nAll input is supplied below; do not call tools, read files, or execute code.\n"
-            + json.dumps(data, ensure_ascii=False, allow_nan=False)
+            model_prompt(operation, name)
+            + "\n"
+            + json.dumps(submission_input(operation, data), ensure_ascii=False, allow_nan=False)
         )
         # Keep business input out of Windows argv length limits and process listings.
         payload = prompt.encode("utf-8")
@@ -132,6 +124,14 @@ class CodeAgentModel(StructuredSkillModel):
         # Preserve the actual stdin bytes, including LF on Windows, for local diagnosis.
         (cwd / "prompt.txt").write_bytes(payload)
         (cwd / "response-schema.json").write_text(schema_json, encoding="utf-8")
+        server = Path(__file__).with_name("submission_server.py").resolve()
+        config = {
+            "mcpServers": {
+                "skill": {"command": sys.executable, "args": ["-I", str(server), str(cwd)]}
+            }
+        }
+        config_path = cwd / "mcp.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
         args = [
             self.executable,
             *([str(self.script_path)] if self.script_path else []),
@@ -146,12 +146,9 @@ class CodeAgentModel(StructuredSkillModel):
             "dontAsk",
             "--strict-mcp-config",
             "--mcp-config",
-            '{"mcpServers":{}}',
-            "--no-session-persistence",
-            "--setting-sources",
-            "",
-            "--json-schema",
-            schema_json,
+            str(config_path),
+            "--allowedTools",
+            tool_name,
         ]
         if self.model:
             args += ["--model", self.model]
@@ -212,9 +209,22 @@ class CodeAgentModel(StructuredSkillModel):
                 or results[0].get("subtype") != "success"
             ):
                 raise AdapterError("CodeAgent did not complete successfully")
-            result = results[0].get("structured_output")
-            if not isinstance(result, dict) or set(result) != {"result"}:
-                raise AdapterError("CodeAgent returned an invalid structured result")
+            if (cwd / "unsafe").exists():
+                raise AdapterError("Unsafe submission")
+            attempts = sorted(cwd.glob("submission-*.json"))
+            metadata["submissions"] = len(attempts)
+            if not (cwd / "accepted.json").exists():
+                detail = (
+                    json.loads(attempts[-1].read_text(encoding="utf-8")).get(
+                        "error", "invalid submission"
+                    )
+                    if attempts
+                    else "tool not called"
+                )
+                raise AdapterError(
+                    f"No accepted submission after {len(attempts)} attempts: {detail}"
+                )
+            result = {"result": json.loads((cwd / "accepted.json").read_text(encoding="utf-8"))}
             reject_sensitive_payload(result)
             serialized = json.dumps(result, ensure_ascii=False)
             for name in self.env_names:
@@ -262,6 +272,8 @@ class CodeAgentModel(StructuredSkillModel):
                 elif process.returncode is None:
                     process.kill()
                 await process.wait()
+            # Keep only the checked result artifact, including on transport failure.
+            (cwd / "accepted.json").unlink(missing_ok=True)
             metadata["elapsed_seconds"] = round(time.monotonic() - started, 3)
             (cwd / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
 
@@ -304,54 +316,6 @@ class CodeAgentModel(StructuredSkillModel):
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-
-
-def _result_schema(operation: str) -> dict[str, Any]:
-    """Give the CLI the same stage schema used by the proven demo adapter."""
-    from app.service.evolution.skill_contracts import (
-        FeedbackAttribution,
-        SkillCluster,
-        SkillCritic,
-    )
-
-    if operation == "cluster":
-        item = SkillCluster.model_json_schema()
-        definitions = item.pop("$defs", {})
-        # Request the same canonical field as HTTP; aliases remain input-compatible.
-        for key in ("summary", "reason"):
-            item["properties"].pop(key)
-        return {
-            "type": "array",
-            "minItems": 1,
-            "maxItems": 1000,
-            "items": item,
-            "$defs": definitions,
-        }
-    if operation == "verify":
-        schema = SkillCritic.model_json_schema()
-        schema["properties"]["repair_plan"] = {"$ref": "#/$defs/RepairPlan"}
-        schema["required"] = list(schema["properties"])
-        return schema
-    if operation == "attribute":
-        return FeedbackAttribution.model_json_schema()
-    if operation in ("patch", "draft_patch"):
-        return {
-            "type": "object",
-            "maxProperties": 128,
-            "additionalProperties": {
-                "anyOf": [
-                    {
-                        "type": "string",
-                        "description": (
-                            "Complete replacement file text, including unchanged content. "
-                            "Never abbreviate with ellipses, placeholders, or omitted sections."
-                        ),
-                    },
-                    {"type": "null"},
-                ],
-            },
-        }
-    raise ValueError("Unknown CodeAgent operation")
 
 
 def codeagent_from_environment() -> CodeAgentModel:

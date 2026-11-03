@@ -10,18 +10,14 @@ Real models can duplicate or omit reports. A single invalid partition terminates
 
 ## Decision
 
-The shared HTTP and CodeAgent model boundary generates clusters at most three times. Only shape or partition validation failures trigger repair feedback, always with the complete canonical input. The core independently enforces exactly-once membership, unique cluster IDs and homogeneous types, accepting no partial results. Feedback distinguishes duplicates, omissions, unknown IDs, attribute mismatches and structural errors. It retains at most 50 details with an explicit truncation flag, complete counts and untruncated probe IDs.
+HTTP and CodeAgent share stage-specific submission tools. The restricted CLI connects to one stdio MCP server exposing only the current tool. HTTP requests bind the same argument schema. Only validated tool results advance the workflow. Transport, timeout, cancellation and safety failures end the operation.
 
-Each validation outcome enters service logs; terminal failures retain attempt and violation counts. Logs contain neither model prose nor raw identifiers. CodeAgent keeps per-call inputs and outputs in local call directories, with details in repair inputs. Safety failures, transport failures and cancellation propagate directly without correction retries. Only complete valid plans can save a `checkpoint` and advance clusters and rounds.
-
-CodeAgent and HTTP request probe_cluster_description for clusters; summary/reason remain compatible legacy input fields. The CLI prompt uses the complete schema passed to --json-schema, including the result wrapper, to avoid conflicting format descriptions. After safety and size checks, each call saves actual stdin bytes to prompt.txt and its schema to response-schema.json, with filenames in input.json; business content stays out of metadata logs. The adapter revision is codeagent-stdin-v3, allowing model identity checks to prevent saved plans from silently resuming under a different execution policy.
+Clustering numbers reports from one within each attribute group. Exact coverage is checked before mapping to frozen report IDs and generating cluster IDs. Review validates snapshot citations and repair plans. Edits target unique original spans in the accepted Skill snapshot. The backend checks conflicts and file safety for the entire batch before constructing changes. Feedback cites validation evidence and each issue must reference the current version.
 
 ## Alternatives considered
 
-Relaxing validation, removing duplicates or filling clusters would change semantic membership without verification. Stronger prompts alone cannot guarantee coverage. Retrying all of prepare expands side effects and repeats verification; bounded repair at the model boundary supports both transports while preserving the core guard.
-
-Changing field names in prompt text alone still leaves two output contracts to maintain. Deriving format instructions from the CLI schema eliminates ambiguity in both fields and wrapping. Business input alone cannot reconstruct the instructions received by the model, so prompts and schemas are retained per call.
+Generating full records requires copying identifiers and unchanged file content. Dedicated tools take model judgments and construct existing domain records on the server. Arbitrary script execution would expand the capability boundary.
 
 ## Consequences
 
-Each attribute group may cost two additional model calls; persistently invalid output still fails explicitly. This budget is separate from blocked-run retry_attempts and adds no failed-run recovery endpoint. Synthetic tests cover duplicates and omissions among 27 reports, recovery, exhaustion, safety boundaries, HTTP/CLI feedback and prepare persistence; CI makes no real model calls.
+Each operation allows three submission attempts. Argument errors return corrective feedback and only one valid proposal advances. The CLI records submission outcomes. Changing the adapter revision activates existing resume identity checks.
