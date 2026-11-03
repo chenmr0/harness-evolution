@@ -18,7 +18,6 @@ function confidence(value: number | null): string {
   <article class="card panel">
     <h3 class="sec-title">
       第 4 步 · 严重程度排序
-      <span class="sub">严重程度 = 置信度 × 影响面 × 报告频次加权（0–10）</span>
     </h3>
     <div
       v-if="step.payload.rows.length"
@@ -55,7 +54,7 @@ function confidence(value: number | null): string {
               {{ confidence(row.confidence) }}
             </td>
             <td class="num">
-              {{ row.impact === null ? "—" : `${row.impact}/10` }}
+              未评估
             </td>
             <td class="num">
               {{ row.reportCount }} 份

@@ -276,7 +276,7 @@ describe("evolution step content", () => {
 
     expect(wrapper.text()).toContain("#1");
     expect(wrapper.text()).toContain("82%");
-    expect(wrapper.text()).toContain("9/10");
+    expect(wrapper.get("tbody tr td:nth-child(5)").text()).toBe("未评估");
     expect(wrapper.text()).toContain("7.4");
   });
 
