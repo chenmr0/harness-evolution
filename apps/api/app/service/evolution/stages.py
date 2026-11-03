@@ -87,6 +87,10 @@ class StepCluster(IdentityModel):
     """One persisted cluster with its probe rows and stored scores."""
 
     probe_cluster_id: str
+    review_status: Literal["pending", "verifying", "verified", "failed", "interrupted"] | None = (
+        None
+    )
+    review_error: str | None = None
     title: str
     description: str
     type: ClusterType
@@ -369,7 +373,7 @@ class EvolutionStageService:
                 }
             )
             for cluster in clusters:
-                item = state.checkpoint["cluster_map"].get(cluster.probe_cluster_id, {})
+                item = state.checkpoint.get("cluster_map", {}).get(cluster.probe_cluster_id, {})
                 probes_of_cluster[cluster.probe_cluster_id] = list(item.get("source_probe_ids", []))
             cluster_of_probe = {pid: cid for cid, ids in probes_of_cluster.items() for pid in ids}
             selected_reports = (
@@ -385,7 +389,9 @@ class EvolutionStageService:
                 probes_of_cluster.setdefault(link.probe_cluster_id, []).append(link.probe_id)
         builders: dict[StepKey, Callable[[], Awaitable[EvolutionStep]]] = {
             "input": lambda: self._input(run, clusters, cluster_of_probe, grouped),
-            "clusters": lambda: self._clusters(run, clusters, probes_of_cluster, grouped),
+            "clusters": lambda: self._clusters(
+                run, clusters, probes_of_cluster, grouped, state.checkpoint if state else {}
+            ),
             "attribution": lambda: self._attribution(
                 run,
                 clusters,
@@ -571,6 +577,7 @@ class EvolutionStageService:
         clusters: Sequence[ProbeClusterRecord],
         probes_of_cluster: dict[str, list[str]],
         grouped: dict[str, list[ProbeHitRow]],
+        checkpoint: dict[str, Any],
     ) -> EvolutionStepClusters:
         """Assemble the cluster list of step 1.
 
@@ -583,6 +590,18 @@ class EvolutionStageService:
         Returns:
             The step 1 envelope with clusters and stored scores.
         """
+        reviews = checkpoint.get("reviews", {})
+
+        def review_status(cluster: ProbeClusterRecord) -> Any:
+            review = reviews.get(cluster.probe_cluster_id)
+            if review:
+                if review["status"] == "verifying" and run.status in {"failed", "interrupted"}:
+                    return "interrupted"
+                return review["status"]
+            if checkpoint.get("cluster_map", {}).get(cluster.probe_cluster_id, {}).get("critic"):
+                return "verified"
+            return "pending" if "partition" in checkpoint else None
+
         return EvolutionStepClusters(
             **self._shell(run, len(clusters), "clusters"),
             payload=StepClustersPayload(
@@ -593,7 +612,14 @@ class EvolutionStageService:
                         description=cluster.probe_cluster_description,
                         type=cluster.probe_cluster_type,
                         probe_count=len(probes_of_cluster.get(cluster.probe_cluster_id, [])),
-                        confidence=cluster.confidence,
+                        review_status=review_status(cluster),
+                        review_error=reviews.get(cluster.probe_cluster_id, {}).get("error"),
+                        confidence=cluster.confidence
+                        if cluster.confidence is not None
+                        else reviews.get(cluster.probe_cluster_id, {})
+                        .get("result", {})
+                        .get("critic", {})
+                        .get("confidence"),
                         severity=cluster.severity,
                         probes=self._probe_items(
                             probes_of_cluster.get(cluster.probe_cluster_id, []),

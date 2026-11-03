@@ -240,6 +240,21 @@ describe("evolution step content", () => {
     expect(wrapper.text()).toContain("probe-1");
   });
 
+  it("shows each review outcome and the failed cluster's reason without expanding", () => {
+    const statuses = ["verified", "failed", "pending"] as const;
+    const clusters = statuses.map((reviewStatus, index) => ({
+      ...clustersStep.payload.clusters[0]!,
+      probeClusterId: `C${index}`,
+      reviewStatus,
+      reviewError: reviewStatus === "failed" ? "CodeAgent timed out" : null,
+    }));
+    const wrapper = mount(StepClusters, { props: {step: {...clustersStep, payload: {clusters}}} });
+    expect(wrapper.get("#cluster-C0").text()).toContain("已核查");
+    expect(wrapper.get("#cluster-C1").text()).toContain("核查失败");
+    expect(wrapper.get("#cluster-C1").text()).toContain("CodeAgent timed out");
+    expect(wrapper.get("#cluster-C2").text()).toContain("待核查");
+  });
+
   it("highlights an addressed cluster and reports a missing target", async () => {
     const highlighted = mount(StepClusters, {
       props: { step: clustersStep, focusCluster: "C1" },

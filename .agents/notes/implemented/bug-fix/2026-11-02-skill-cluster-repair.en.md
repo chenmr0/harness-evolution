@@ -14,6 +14,8 @@ HTTP and CodeAgent share stage-specific submission tools. The restricted CLI con
 
 Clustering numbers reports from one within each attribute group. Exact coverage is checked before mapping to frozen report IDs and generating cluster IDs. Review validates snapshot citations and repair plans. Edits target unique original spans in the accepted Skill snapshot. The backend checks conflicts and file safety for the entire batch before constructing changes. Feedback cites validation evidence and each issue must reference the current version.
 
+A validated partition, its source mapping and stable cluster IDs are saved before opening the cluster step. Each review persists its start, success or failure, retaining a sanitized failure reason and pending groups. Re-entering prepare reuses completed reviews. Candidate rounds are ordered by priority only after all reviews succeed. This keeps clusters inspectable after failure and prevents ranking from associating a repair plan with the wrong cluster.
+
 ## Alternatives considered
 
 Generating full records requires copying identifiers and unchanged file content. Dedicated tools take model judgments and construct existing domain records on the server. Arbitrary script execution would expand the capability boundary.

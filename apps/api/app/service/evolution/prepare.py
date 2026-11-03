@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Protocol, cast
 
+from pydantic import ValidationError
+
 from app.db.crud.evolution import EvolutionRepository
 from app.db.crud.probe_query import ProbeHitQuery, ProbeHitRow, ProbeQueryRepository
 from app.db.models.evolution import (
@@ -38,6 +40,20 @@ from app.utils.ids import new_id
 from app.utils.redaction import sanitize_message
 
 logger = logging.getLogger(__name__)
+
+
+def _review_error(exc: Exception) -> str:
+    if isinstance(exc, ValidationError):
+        # Never include rejected model content in either the cluster or run error.
+        errors = exc.errors(include_input=False, include_context=False)
+        fields = []
+        for error in errors[:5]:
+            field = (
+                error["loc"][0] if error["loc"] and error["type"] != "extra_forbidden" else "review"
+            )
+            fields.append(f"{field} ({error['type']})")
+        return sanitize_message("Invalid review fields: " + ", ".join(fields))
+    return sanitize_message(str(exc) or type(exc).__name__)
 
 
 class PrepareEventRecorder(Protocol):
@@ -426,6 +442,7 @@ class EvolutionPrepareService:
                     "base_commit": workspace.base_commit,
                 },
             )
+        from app.service.evolution.skill_core import SkillPlan
         from app.service.evolution.skill_identity import skill_identity
 
         checkpoint = dict(state.checkpoint)
@@ -433,43 +450,79 @@ class EvolutionPrepareService:
         if checkpoint.get("identity", identity) != identity:
             raise ValueError("Skill model or strategy changed since preparation")
         checkpoint["identity"] = identity
-        if "plan" not in checkpoint:
-            plan = await self._skill_core.plan(
-                list(state.input_snapshot["reports"]),
-                dict(state.input_snapshot["files"]),
-            )
-            checkpoint.update(plan=asdict(plan), best_files=dict(state.input_snapshot["files"]))
+
+        async def save() -> None:
+            nonlocal state
             state = await self._skill_states.save_checkpoint(
-                run.id,
-                checkpoint,
-                expected_revision=state.revision,
+                run.id, checkpoint, expected_revision=state.revision
             )
-        plan_data = checkpoint["plan"]
-        planned = plan_data["clusters"]
+
+        # Older checkpoints already contain a ranked plan and used its order for row IDs.
+        if "plan" not in checkpoint and "partition" not in checkpoint:
+            partition = await self._skill_core.partition(
+                list(state.input_snapshot["reports"]), dict(state.input_snapshot["files"])
+            )
+            checkpoint["partition"] = asdict(partition)
+            await save()
+        layout = checkpoint.get("partition") or checkpoint["plan"]
+        groups = layout["clusters"]
         current = await self._runs.get_run(run.id)
         if current is None:
             raise LookupError("evolution run disappeared")
         if current.progress_unit == 0:
-            await self._runs.advance_unit(run.id, expected=0, target=1, cluster_count=len(planned))
+            await self._runs.advance_unit(run.id, expected=0, target=1, cluster_count=len(groups))
+        clusters = await self._runs.list_clusters(run.id)
         if current.progress_unit <= 1:
-            clusters = await self._runs.replace_clusters(
-                run.id,
-                tuple(
-                    ClusterWrite(
-                        type=item["attribute_type"],
-                        description=item["probe_cluster_description"],
-                        probes=tuple(item["source_probe_ids"]),
-                        impact=1.0,
+            if not clusters:
+                clusters = await self._runs.replace_clusters(
+                    run.id,
+                    tuple(
+                        ClusterWrite(
+                            type=g["attribute_type"],
+                            description=g["probe_cluster_description"],
+                            probes=tuple(g["source_probe_ids"]),
+                            impact=1.0,
+                        )
+                        for g in groups
+                    ),
+                )
+            checkpoint["cluster_map"] = {
+                c.probe_cluster_id: g for c, g in zip(clusters, groups, strict=True)
+            }
+            await save()
+            await self._runs.advance_unit(run.id, expected=1, target=2, cluster_count=len(groups))
+
+        ids = {g["cluster_id"]: c.probe_cluster_id for c, g in zip(clusters, groups, strict=True)}
+        if "plan" not in checkpoint:
+            partition = SkillPlan(**layout)
+            reviews = checkpoint.setdefault("reviews", {})
+            checked = []
+            for group in groups:
+                cid = ids[group["cluster_id"]]
+                previous = reviews.get(cid, {})
+                if previous.get("status") == "verified":
+                    checked.append(previous["result"])
+                    continue
+                reviews[cid] = {"status": "verifying"}
+                await save()
+                try:
+                    item = await self._skill_core.verify_cluster(
+                        group, partition, dict(state.input_snapshot["files"])
                     )
-                    for item in planned
-                ),
-            )
-            await self._runs.advance_unit(run.id, expected=1, target=2, cluster_count=len(planned))
-        else:
-            clusters = await self._runs.list_clusters(run.id)
-        mapping = {
-            cluster.probe_cluster_id: item for cluster, item in zip(clusters, planned, strict=True)
-        }
+                except Exception as exc:
+                    reviews[cid] = {"status": "failed", "error": _review_error(exc)}
+                    await save()
+                    if isinstance(exc, ValidationError):
+                        raise ValueError(reviews[cid]["error"]) from None
+                    raise
+                reviews[cid] = {"status": "verified", "result": item}
+                await save()
+                checked.append(item)
+            plan = self._skill_core.rank(partition, checked)
+            checkpoint.update(plan=asdict(plan), best_files=dict(state.input_snapshot["files"]))
+            await save()
+        planned = checkpoint["plan"]["clusters"]
+        mapping = {ids[item["cluster_id"]]: item for item in planned}
         if current.progress_unit <= 2:
             await self._runs.write_cluster_confidence(
                 run.id, {key: item["critic"]["confidence"] for key, item in mapping.items()}

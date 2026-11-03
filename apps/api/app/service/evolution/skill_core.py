@@ -217,6 +217,16 @@ class SkillEvolutionCore:
         round_number: int = 1,
     ) -> SkillPlan:
         """Produce verified source-compatible ranking without publishing changes."""
+        partition = await self.partition(reports, files, round_number)
+        checked = [
+            await self.verify_cluster(cluster, partition, files) for cluster in partition.clusters
+        ]
+        return self.rank(partition, checked)
+
+    async def partition(
+        self, reports: list[Json], files: dict[str, str], round_number: int = 1
+    ) -> SkillPlan:
+        """Validate the entire partition before exposing any group for review."""
         if not reports or len(reports) > 1000 or round_number < 1:
             raise ValueError("invalid Skill planning input")
         reject_sensitive_payload(reports)
@@ -250,35 +260,42 @@ class SkillEvolutionCore:
                 prefix = f"r{round_number}:" if round_number > 1 else ""
                 item["cluster_id"] = f"{prefix}{attribute}:{item['cluster_id']}"
             raw.extend(part)
-        ranked = []
+        clusters = validate_clusters(raw, canonical)
+        for cluster in clusters:
+            cluster["source_probe_ids"] = cluster["probe_ids"] + sorted(
+                alias for alias, source in aliases.items() if source in cluster["probe_ids"]
+            )
+        return SkillPlan(tuple(clusters), tuple(canonical), aliases)
+
+    async def verify_cluster(
+        self, cluster: Json, partition: SkillPlan, files: dict[str, str]
+    ) -> Json:
+        """Review one cluster against the frozen Skill files."""
+        members = [r for r in partition.canonical_reports if r["probe_id"] in cluster["probe_ids"]]
+        inputs = {k: v for k, v in cluster.items() if k != "source_probe_ids"}
+        critic = SkillCritic.model_validate(await self.model.verify(inputs, members, files))
+        critic_data = critic.model_dump(mode="json")
+        reject_sensitive_payload(critic_data)
         config = self.strategy
-        for cluster in validate_clusters(raw, canonical):
-            reject_sensitive_payload(cluster)
-            members = [r for r in canonical if r["probe_id"] in cluster["probe_ids"]]
-            critic = SkillCritic.model_validate(await self.model.verify(cluster, members, files))
-            critic_data = critic.model_dump(mode="json")
-            reject_sensitive_payload(critic_data)
-            support = len(members)
-            priority = (
-                config.severity_weight * critic.severity
-                + config.confidence_weight * critic.confidence
-                + config.frequency_weight * math.log1p(support) / math.log1p(len(canonical))
-            ) * config.type_weights[cluster["attribute_type"]]
-            source_ids = cluster["probe_ids"] + sorted(
-                alias
-                for alias, canonical_id in aliases.items()
-                if canonical_id in cluster["probe_ids"]
-            )
-            ranked.append(
-                dict(
-                    cluster,
-                    critic=critic_data,
-                    support=support,
-                    priority=priority,
-                    source_probe_ids=source_ids,
-                    eligible=critic.confidence >= config.confidence_threshold,
-                )
-            )
+        support = len(members)
+        priority = (
+            config.severity_weight * critic.severity
+            + config.confidence_weight * critic.confidence
+            + config.frequency_weight
+            * math.log1p(support)
+            / math.log1p(len(partition.canonical_reports))
+        ) * config.type_weights[cluster["attribute_type"]]
+        return dict(
+            cluster,
+            critic=critic_data,
+            support=support,
+            priority=priority,
+            eligible=critic.confidence >= config.confidence_threshold,
+        )
+
+    def rank(self, partition: SkillPlan, ranked: list[Json]) -> SkillPlan:
+        """Select candidates only after all reviews are durable."""
+        config = self.strategy
         ranked.sort(key=lambda c: (-c["priority"], c["cluster_id"]))
         remaining = config.max_candidates if config.max_candidates is not None else len(ranked)
         for rank, cluster in enumerate(ranked, 1):
@@ -298,7 +315,7 @@ class SkillEvolutionCore:
             }[disposition]
             if disposition == "selected":
                 remaining -= 1
-        return SkillPlan(tuple(ranked), tuple(canonical), aliases)
+        return SkillPlan(tuple(ranked), partition.canonical_reports, partition.aliases)
 
     async def patch(self, cluster: Json, reports: list[Json], files: dict[str, str]) -> SkillPatch:
         """Generate against the current accepted tree and validate every change."""

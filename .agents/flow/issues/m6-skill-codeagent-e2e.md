@@ -13,6 +13,7 @@ status: in-progress
 scope:
   - apps/api/**
   - apps/web/**
+  - packages/contracts/**
   - tests/e2e/**
   - docs/**
   - .agents/flow/**

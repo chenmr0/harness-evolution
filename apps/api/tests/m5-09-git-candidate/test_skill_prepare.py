@@ -14,7 +14,10 @@ from app.db.crud.evolution import EvolutionRepository
 from app.db.crud.probe_query import ProbeQueryRepository
 from app.db.crud.skill_evolution import SkillEvolutionRepository
 from app.db.models.domain import probe_reports
-from app.service.evolution.prepare import EvolutionPrepareService, RepositoryProbeReader
+from app.service.evolution.prepare import (
+    EvolutionPrepareService,
+    RepositoryProbeReader,
+)
 from app.service.evolution.skill_core import SkillEvolutionCore
 from app.third_party_api.git.workspace import GitWorkspaceManager
 from app.third_party_api.skill_model import AdapterError, StructuredSkillModel
@@ -294,3 +297,98 @@ async def test_cluster_repair_commits_only_a_complete_valid_plan(
     assert model.verified == (2 if recovers else 0)
     run = await repository.get_run(run_id)
     assert run is not None and run.progress_unit == (4 if recovers else 0)
+
+
+async def test_verify_failure_preserves_visible_partition(
+    prepare_state: tuple[Database, EvolutionRepository, EvolutionPrepareService, str, str],
+    tmp_path: Path,
+) -> None:
+    from sqlalchemy import insert, select
+
+    from app.db.models.domain import bad_case_analysis, bad_cases
+    from app.service.evolution.stages import EvolutionStageService, EvolutionStepClusters
+
+    database, repo, _, url, commit = prepare_state
+    rid = "run-m5-09-prepare"
+    await repo.create_run(_run_values(url, commit))
+    states = SkillEvolutionRepository(database)
+    query = ProbeQueryRepository(database)
+    stages = EvolutionStageService(repo, query, skill_states=states)
+    async with database.transaction() as session:
+        for table, changes in (
+            (probe_reports, {"probe_id": "third", "attribute_type": "prompt"}),
+            (bad_cases, {"bad_case_id": "case-3"}),
+            (bad_case_analysis, {"probe_id": "third", "bad_case_id": "case-3"}),
+        ):
+            row = dict((await session.execute(select(table).limit(1))).mappings().one())
+            row.pop("id", None)
+            await session.execute(insert(table).values({**row, **changes}))
+
+    class FailSecond(Model):
+        async def verify(
+            self, cluster: dict[str, Any], reports: list[dict[str, Any]], files: dict[str, str]
+        ) -> dict[str, Any]:
+            if cluster["attribute_type"] == "model":
+                live = await stages.step(rid, "clusters")
+                assert isinstance(live, EvolutionStepClusters)
+                assert [c.review_status for c in live.payload.clusters] == [
+                    "verified",
+                    "verifying",
+                    "pending",
+                ]
+                raise AdapterError("CodeAgent timed out")
+            return await super().verify(cluster, reports, files)
+
+    service = EvolutionPrepareService(
+        repo,
+        RepositoryProbeReader(query),
+        GitWorkspaceManager(repos_root=tmp_path / "repos", workspaces_root=tmp_path / "ws"),
+        skill_core=SkillEvolutionCore(FailSecond()),
+        skill_states=states,
+    )
+    with pytest.raises(AdapterError, match="CodeAgent timed out"):
+        await service.handle(_job(rid))
+    await repo.mark_failed(rid, stage="prepare", message="CodeAgent timed out")
+    page = await stages.step(rid, "clusters")
+    assert isinstance(page, EvolutionStepClusters)
+    assert page.clickable
+    assert [(c.type, c.review_status, c.review_error) for c in page.payload.clusters] == [
+        ("error", "verified", None),
+        ("model", "failed", "CodeAgent timed out"),
+        ("prompt", "pending", None),
+    ]
+    assert all(c.probe_count == len(c.probes) == 1 for c in page.payload.clusters)
+    assert not await repo.list_rounds(rid)
+
+
+async def test_resume_reuses_partition_ids_and_verified_reviews(
+    prepare_state: tuple[Database, EvolutionRepository, EvolutionPrepareService, str, str],
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    class InterruptOnce(Model):
+        seen: list[str]
+
+        async def verify(
+            self, cluster: dict[str, Any], reports: list[dict[str, Any]], files: dict[str, str]
+        ) -> dict[str, Any]:
+            self.seen.append(cluster["cluster_id"])
+            if len(self.seen) == 2:
+                raise asyncio.CancelledError()
+            return await super().verify(cluster, reports, files)
+
+    model = InterruptOnce()
+    model.seen = []
+    db, repo, _, url, commit = prepare_state
+    rid = "run-m5-09-prepare"
+    await repo.create_run(_run_values(url, commit))
+    service = service_for(db, repo, model, tmp_path)
+    with pytest.raises(asyncio.CancelledError):
+        await service.handle(_job(rid))
+    before = await repo.list_clusters(rid)
+    await service.handle(_job(rid))
+    after = await repo.list_clusters(rid)
+    assert [c.probe_cluster_id for c in before] == [c.probe_cluster_id for c in after]
+    assert model.calls == 2
+    assert model.seen == ["error:one", "model:one", "model:one"]

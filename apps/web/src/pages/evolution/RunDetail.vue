@@ -40,6 +40,7 @@ const {
   data: run,
   error: runError,
   isPending: runPending,
+  dataUpdatedAt: detailUpdatedAt,
   refetch: refetchRun,
 } = useEvolutionRunDetail(runId, {
   refetchInterval: runDetailRefetchInterval,
@@ -169,6 +170,11 @@ const {
   selectedKey,
   computed(() => selectedStep.value?.clickable === true),
 );
+
+// Refresh the selected cluster list as reviews finish, including the terminal snapshot.
+watch(() => detailUpdatedAt.value, () => {
+  if (selectedKey.value === "clusters" && selectedStep.value?.clickable) void refetchStep();
+});
 
 const statusLabel = computed(() => {
   switch (run.value?.status) {

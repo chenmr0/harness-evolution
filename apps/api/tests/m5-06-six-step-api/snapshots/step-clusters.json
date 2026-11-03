@@ -9,6 +9,8 @@
     "clusters": [
       {
         "probeClusterId": "C1",
+        "reviewStatus": null,
+        "reviewError": null,
         "title": "检索索引读取失败",
         "description": "检索索引读取失败",
         "type": "error",

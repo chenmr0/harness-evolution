@@ -3861,6 +3861,35 @@
             "title": "Probes",
             "type": "array"
           },
+          "reviewError": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewerror"
+          },
+          "reviewStatus": {
+            "anyOf": [
+              {
+                "enum": [
+                  "pending",
+                  "verifying",
+                  "verified",
+                  "failed",
+                  "interrupted"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewstatus"
+          },
           "severity": {
             "anyOf": [
               {

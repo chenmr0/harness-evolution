@@ -12,6 +12,8 @@ const emit = defineEmits<{
   "missing-focus": [];
 }>();
 
+const reviewLabels = { pending: "待核查", verifying: "核查中", verified: "已核查", failed: "核查失败", interrupted: "核查中断" } as const;
+
 const expanded = ref<Set<string>>(new Set());
 const highlighted = ref<string | null>(null);
 const missingNotice = ref(false);
@@ -91,6 +93,10 @@ watch(
           class="type-chip"
           :class="`type-${cluster.type}`"
         >{{ typeLabel(cluster.type) }}</span>
+        <span
+          v-if="cluster.reviewStatus"
+          class="meta"
+        >{{ reviewLabels[cluster.reviewStatus] }}</span>
         <span class="meta">probe ×{{ cluster.probeCount }}</span>
         <span
           v-if="cluster.confidence !== null"
@@ -100,6 +106,12 @@ watch(
           <span class="caret">▶</span>
         </span>
       </button>
+      <p
+        v-if="cluster.reviewError"
+        class="review-error"
+      >
+        失败原因：{{ cluster.reviewError }}
+      </p>
       <div
         v-if="expanded.has(cluster.probeClusterId)"
         class="cluster-body"
@@ -120,6 +132,7 @@ watch(
 </template>
 
 <style scoped>
+.review-error { margin: 0; padding: 8px 14px; color: var(--text); overflow-wrap: anywhere; }
 .card {
   border: 1px solid var(--border);
   border-radius: 12px;

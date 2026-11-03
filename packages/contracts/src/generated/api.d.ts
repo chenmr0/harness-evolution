@@ -2306,6 +2306,10 @@ export interface components {
             probeCount: number;
             /** Probes */
             probes: components["schemas"]["ProbePreviewItem"][];
+            /** Reviewerror */
+            reviewError?: string | null;
+            /** Reviewstatus */
+            reviewStatus?: ("pending" | "verifying" | "verified" | "failed" | "interrupted") | null;
             /** Severity */
             severity: number | null;
             /** Title */
